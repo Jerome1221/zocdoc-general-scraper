@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Zocdoc Provider HTML Saver",
+  "version": "1.5.1",
+  "description": "Saves rendered Zocdoc specialty, listing, and provider-profile HTML through a local collector.",
+  "permissions": [
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.zocdoc.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.zocdoc.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://127.0.0.1/*",
+        "http://localhost/*"
+      ],
+      "js": [
+        "controller.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

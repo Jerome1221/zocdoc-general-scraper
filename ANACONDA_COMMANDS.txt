@@ -1,0 +1,42 @@
+DEV9.6 DAILY UPDATER - ANACONDA PROMPT
+=======================================
+
+1. Enter the extracted package and create its venv:
+
+cd /d C:\path\to\zocdoc-provider-collector-0.2.0.dev9.6.0-daily-sync
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[postgres]"
+
+Use `python -m pip install -e .` instead when PostgreSQL is not needed.
+
+2. Point at the workspace that already contains collector.db:
+
+set WS=C:\path\to\workspace_test
+
+3. Seed the new canonical tables from data already scraped:
+
+zocdoc-collector --workspace "%WS%" updater bootstrap
+zocdoc-collector --workspace "%WS%" updater status
+
+4. Start browser runners:
+
+zocdoc-collector --workspace "%WS%" runners start
+zocdoc-collector --workspace "%WS%" runners status
+
+5. Test the complete production path on five already successful locations:
+
+zocdoc-collector --workspace "%WS%" updater daily --live --from-snapshots --limit 5 --removal-confirmations 1
+zocdoc-collector --workspace "%WS%" updater status
+
+6. Run every active known specialty/location with production removal safety:
+
+zocdoc-collector --workspace "%WS%" updater daily --live
+
+7. Run every 24 hours in the foreground:
+
+zocdoc-collector --workspace "%WS%" updater daemon --live --interval-hours 24
+
+See DAILY_UPDATER_GUIDE.md for Windows Task Scheduler, PostgreSQL, profile
+recovery, safety behavior, and full operating notes.

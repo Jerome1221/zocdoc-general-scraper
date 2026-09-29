@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime collector data (never commit scraped/runtime data by default)
+workspace/
+**/collector.db
+**/collector.db-wal
+**/collector.db-shm
+**/captured/
+**/saved_html/
+**/saved_profiles/
+**/output/
+**/manifest.csv
+**/BLOCKED.flag
+*.log
+
+# Notebook artifacts
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+
+workspace_test/
+
+# Multi-runner Chrome profiles and logs
+.runners/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# All local database variants and backups
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Coverage and temporary files
+.coverage
+htmlcov/
+coverage.xml
+*.tmp
