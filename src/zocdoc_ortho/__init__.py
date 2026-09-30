@@ -3,4 +3,4 @@
 from .schema import REQUIRED_COLUMNS
 
 __all__ = ["REQUIRED_COLUMNS"]
-__version__ = "0.2.0.dev9+saferunner1"
+__version__ = "0.2.0.dev9+dailyupdater961"

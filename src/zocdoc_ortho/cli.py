@@ -9,21 +9,23 @@ from pathlib import Path
 
 import pandas as pd
 
-from .db import connect
 from .daily_sync import (
     bootstrap_from_trace,
+    daily_sync_lock,
     daily_sync_status,
+    migrate_profiles_from_export,
     resume_daily_profiles,
     run_daily_daemon,
     run_daily_sync,
 )
+from .db import connect
 from .export import derive_outputs, export_final
 from .legacy import import_legacy
 from .listing import seed_locations
 from .outputs import export_page_outputs
 from .performance import performance_report
-from .profile import parse_profile_rows
 from .postgres_sync import publish_to_postgres
+from .profile import parse_profile_rows
 from .queue import (
     audit_zero_link_listings,
     choose_listing_phase,
@@ -163,6 +165,16 @@ def build_parser() -> argparse.ArgumentParser:
     updater_sub.add_parser(
         "bootstrap",
         help="Seed canonical provider memberships from already parsed listing trace data",
+    )
+    updater_migrate_profiles = updater_sub.add_parser(
+        "migrate-profiles",
+        help="Import existing unique_doctors.csv profiles without browser requests",
+    )
+    updater_migrate_profiles.add_argument(
+        "--input",
+        type=Path,
+        default=None,
+        help="Profile CSV; defaults to workspace/output/unique_doctors.csv",
     )
     updater_status = updater_sub.add_parser("status", help="Show canonical updater status and recent runs")
     updater_status.add_argument("--limit", type=int, default=10)
@@ -586,7 +598,24 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Locations imported     : {result['locations']:,}")
                 print(f"Memberships imported   : {result['memberships']:,}")
                 print(f"Unique providers       : {result['providers']:,}")
+                print(f"Profiles imported      : {result['profiles_imported']:,}")
                 print(f"Profiles queued        : {result['profiles_queued']:,}")
+                print("No browser requests were made.")
+                print("=" * 72)
+                return 0
+
+            if args.updater_command == "migrate-profiles":
+                with daily_sync_lock(workspace):
+                    result = migrate_profiles_from_export(workspace, input_path=args.input)
+                print("=" * 72)
+                print("CANONICAL PROFILE MIGRATION")
+                print("=" * 72)
+                print(f"Source                 : {result['source']}")
+                print(f"Rows scanned           : {result['scanned']:,}")
+                print(f"Profiles imported      : {result['imported']:,}")
+                print(f"Already canonical      : {result['already_present']:,}")
+                print(f"Invalid rows           : {result['invalid']:,}")
+                print(f"Not in current baseline: {result['unmatched']:,}")
                 print("No browser requests were made.")
                 print("=" * 72)
                 return 0

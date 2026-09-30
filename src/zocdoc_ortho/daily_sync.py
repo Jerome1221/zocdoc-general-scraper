@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -7,11 +8,12 @@ import sqlite3
 import time
 import uuid
 from collections import defaultdict, deque
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from .db import connect
 from .listing import classify_listing_capture, parse_page
@@ -874,6 +876,154 @@ def _profile_file_age_days(path: Path) -> float:
     return max(0.0, (time.time() - path.stat().st_mtime) / 86400.0)
 
 
+def _profile_age_days(path: Path | None, updated_at: str | None) -> float:
+    updated = _parse_timestamp(updated_at)
+    if updated is not None:
+        return max(0.0, (datetime.now(UTC) - updated).total_seconds() / 86400.0)
+    if path is not None:
+        return _profile_file_age_days(path)
+    return float("inf")
+
+
+def _profile_export_row(row: dict[str, str], doctor_url: str) -> dict[str, Any]:
+    normalized: dict[str, Any] = {
+        key: value for key, value in row.items() if key and value is not None
+    }
+    normalized["profile_url"] = doctor_url
+    for key in ("hospital_affiliations", "locations"):
+        value = normalized.get(key, "")
+        try:
+            normalized[key] = json.loads(value) if value else []
+        except (TypeError, json.JSONDecodeError):
+            normalized[key] = []
+    for key in (
+        "accepts_new_patients",
+        "offers_telemedicine",
+        "only_sees_children",
+    ):
+        value = str(normalized.get(key, "")).strip().lower()
+        if value in {"true", "1", "yes"}:
+            normalized[key] = True
+        elif value in {"false", "0", "no"}:
+            normalized[key] = False
+        else:
+            normalized[key] = None
+    value = str(normalized.get("num_locations", "")).strip()
+    normalized["num_locations"] = int(value) if value.isdigit() else len(normalized["locations"])
+    return normalized
+
+
+def migrate_profiles_from_export(
+    workspace: Workspace,
+    *,
+    input_path: Path | None = None,
+) -> dict[str, Any]:
+    """Import existing structured profiles without reopening provider pages."""
+    source = (input_path or (workspace.output_dir / "unique_doctors.csv")).resolve()
+    if not source.exists():
+        raise FileNotFoundError(source)
+
+    with connect(workspace) as conn:
+        canonical = {
+            normalize_url(row["doctor_url"]): bool(row["profile_sha256"])
+            for row in conn.execute(
+                "SELECT doctor_url,profile_sha256 FROM canonical_provider_records"
+            ).fetchall()
+        }
+
+    source_updated_at = datetime.fromtimestamp(source.stat().st_mtime, tz=UTC).isoformat()
+    diagnostics_json = json.dumps(
+        {"migrated_from_export": True, "source": source.name},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    scanned = 0
+    imported = 0
+    already_present = 0
+    invalid = 0
+    unmatched = 0
+    seen: set[str] = set()
+    batch: list[tuple[Any, ...]] = []
+
+    def flush() -> None:
+        nonlocal imported
+        if not batch:
+            return
+        with connect(workspace) as conn:
+            conn.executemany(
+                """
+                UPDATE canonical_provider_records
+                SET doctor_name=CASE WHEN ?<>'' THEN ? ELSE doctor_name END,
+                    profile_file=?,profile_sha256=?,profile_data_json=?,
+                    profile_diagnostics_json=?,profile_updated_at=?
+                WHERE doctor_url=? AND COALESCE(profile_sha256,'')=''
+                """,
+                batch,
+            )
+            conn.commit()
+        imported += len(batch)
+        batch.clear()
+
+    with source.open("r", newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        required = {"profile_url", "full_name"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError(
+                f"{source.name} must contain the columns: {', '.join(sorted(required))}"
+            )
+        for row in reader:
+            scanned += 1
+            doctor_url = normalize_url(row.get("profile_url") or "")
+            if not doctor_url or doctor_url in seen:
+                invalid += 1
+                continue
+            seen.add(doctor_url)
+            if doctor_url not in canonical:
+                unmatched += 1
+                continue
+            if canonical[doctor_url]:
+                already_present += 1
+                continue
+            doctor_name = " ".join((row.get("full_name") or "").split())
+            if not doctor_name:
+                invalid += 1
+                continue
+            profile = _profile_export_row(row, doctor_url)
+            profile_json = json.dumps(
+                [profile],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            digest = hashlib.sha256(profile_json.encode("utf-8")).hexdigest()
+            batch.append(
+                (
+                    doctor_name,
+                    doctor_name,
+                    source.name,
+                    digest,
+                    profile_json,
+                    diagnostics_json,
+                    source_updated_at,
+                    doctor_url,
+                )
+            )
+            canonical[doctor_url] = True
+            if len(batch) >= 500:
+                flush()
+        flush()
+
+    return {
+        "source": str(source),
+        "scanned": scanned,
+        "imported": imported,
+        "already_present": already_present,
+        "invalid": invalid,
+        "unmatched": unmatched,
+    }
+
+
 def _store_profile_html(
     conn: sqlite3.Connection,
     *,
@@ -977,11 +1127,29 @@ def prepare_profile_queue(
             """,
             (run_id,),
         ).fetchall()
+        run = conn.execute(
+            "SELECT scope FROM daily_sync_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        if not providers and run is not None and run["scope"] == "bootstrap":
+            providers = conn.execute(
+                """
+                SELECT doctor_url,MAX(doctor_name) doctor_name,0 reactivated
+                FROM provider_location_memberships
+                WHERE last_seen_run_id=? AND is_active=1
+                GROUP BY doctor_url
+                ORDER BY doctor_url
+                """,
+                (run_id,),
+            ).fetchall()
         for provider in providers:
             doctor_url = normalize_url(provider["doctor_url"])
             path = find_profile_html(workspace, doctor_url)
             canonical = conn.execute(
-                "SELECT profile_sha256 FROM canonical_provider_records WHERE doctor_url=?",
+                """
+                SELECT profile_sha256,profile_updated_at
+                FROM canonical_provider_records WHERE doctor_url=?
+                """,
                 (doctor_url,),
             ).fetchone()
             if path is not None and (canonical is None or not canonical["profile_sha256"]):
@@ -995,18 +1163,24 @@ def prepare_profile_queue(
                 )
                 if valid:
                     canonical = conn.execute(
-                        "SELECT profile_sha256 FROM canonical_provider_records WHERE doctor_url=?",
+                        """
+                        SELECT profile_sha256,profile_updated_at
+                        FROM canonical_provider_records WHERE doctor_url=?
+                        """,
                         (doctor_url,),
                     ).fetchone()
 
             reason = ""
-            if path is None:
-                reason = "missing_profile"
-            elif canonical is None or not canonical["profile_sha256"]:
-                reason = "unparsed_profile"
+            if canonical is None or not canonical["profile_sha256"]:
+                if path is None:
+                    reason = "missing_profile"
+                else:
+                    reason = "unparsed_profile"
             elif int(provider["reactivated"] or 0):
                 reason = "reactivated"
-            elif refresh_days == 0 or _profile_file_age_days(path) >= refresh_days:
+            elif refresh_days == 0 or _profile_age_days(
+                path, canonical["profile_updated_at"]
+            ) >= refresh_days:
                 reason = "stale_profile"
             if not reason:
                 continue
@@ -1475,7 +1649,8 @@ def bootstrap_from_trace(workspace: Workspace) -> dict[str, int]:
                 rows = conn.execute(
                     """
                     SELECT t.*,p.page_no FROM listing_provider_trace t
-                    JOIN pages p ON p.url=t.listing_url
+                    JOIN pages p INDEXED BY idx_pages_base_location_url
+                      ON p.url=t.listing_url
                     WHERE p.base_location_url=?
                     ORDER BY t.doctor_url,p.page_no,t.card_index
                     """,
@@ -1542,6 +1717,19 @@ def bootstrap_from_trace(workspace: Workspace) -> dict[str, int]:
                     (len(grouped), digest, base, base, stamp, stamp, run_id, target.specialty_slug, base),
                 )
             conn.commit()
+        profile_source = workspace.output_dir / "unique_doctors.csv"
+        profile_migration = (
+            migrate_profiles_from_export(workspace, input_path=profile_source)
+            if profile_source.exists()
+            else {
+                "source": str(profile_source),
+                "scanned": 0,
+                "imported": 0,
+                "already_present": 0,
+                "invalid": 0,
+                "unmatched": 0,
+            }
+        )
         prepare_profile_queue(workspace, run_id, refresh_days=DEFAULT_PROFILE_REFRESH_DAYS)
         result = _finalize_run(
             workspace,
@@ -1553,6 +1741,7 @@ def bootstrap_from_trace(workspace: Workspace) -> dict[str, int]:
             "locations": int(result["locations_completed"]),
             "memberships": memberships,
             "providers": len(providers),
+            "profiles_imported": int(profile_migration["imported"]),
             "profiles_queued": int(result["profiles_queued"]),
         }
 

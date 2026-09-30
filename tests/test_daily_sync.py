@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from zocdoc_ortho.daily_sync import bootstrap_from_trace, resume_daily_profiles, run_daily_sync
+import csv
+import json
+
+from zocdoc_ortho.daily_sync import (
+    bootstrap_from_trace,
+    migrate_profiles_from_export,
+    resume_daily_profiles,
+    run_daily_sync,
+)
 from zocdoc_ortho.db import connect
 from zocdoc_ortho.queue import _ingest_listing
 from zocdoc_ortho.urls import page_number, safe_slug
@@ -275,7 +283,122 @@ def test_bootstrap_seeds_existing_trace_without_browser_requests(tmp_path):
     assert result["locations"] == 1
     assert result["memberships"] == 1
     assert result["providers"] == 1
+    assert result["profiles_imported"] == 0
+    assert result["profiles_queued"] == 1
     with connect(workspace) as conn:
         assert conn.execute(
             "SELECT COUNT(*) n FROM provider_location_memberships WHERE is_active=1"
         ).fetchone()["n"] == 1
+
+
+def test_bootstrap_migrates_export_and_does_not_reopen_canonical_profile(tmp_path, monkeypatch):
+    workspace = Workspace(tmp_path / "workspace").ensure()
+    listing_url = _seed_target(workspace)
+    doctor_url = "https://www.zocdoc.com/doctor/alpha-doctor-md-1"
+    html = _listing_html(
+        listing_url,
+        [("alpha-doctor-md-1", "Alpha Doctor")],
+        advertised_total=1,
+    )
+    path = workspace.listing_dir / "bootstrap-export.html"
+    path.write_text(html, encoding="utf-8")
+    with connect(workspace) as conn:
+        _ingest_listing(conn, workspace, listing_url, path, write_outputs=False)
+
+    export_path = workspace.output_dir / "unique_doctors.csv"
+    with export_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "full_name",
+                "profile_url",
+                "accepts_new_patients",
+                "hospital_affiliations",
+                "num_locations",
+                "locations",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "full_name": "Alpha Doctor, MD",
+                "profile_url": doctor_url,
+                "accepts_new_patients": "True",
+                "hospital_affiliations": "[]",
+                "num_locations": "1",
+                "locations": json.dumps([{"city": "New York", "state": "NY"}]),
+            }
+        )
+
+    result = bootstrap_from_trace(workspace)
+
+    assert result["profiles_imported"] == 1
+    assert result["profiles_queued"] == 0
+    assert not (workspace.profile_dir / safe_slug(doctor_url)).exists()
+    with connect(workspace) as conn:
+        record = conn.execute(
+            """
+            SELECT profile_sha256,profile_data_json,profile_updated_at
+            FROM canonical_provider_records WHERE doctor_url=?
+            """,
+            (doctor_url,),
+        ).fetchone()
+        assert record["profile_sha256"]
+        assert record["profile_updated_at"]
+        assert "Alpha Doctor" in record["profile_data_json"]
+
+    _mock_runners(monkeypatch)
+
+    def fake_enqueue(url, *, server_url, capture_token, timeout=3.0):
+        (workspace.updater_snapshot_dir / f"{capture_token}.html").write_text(
+            html, encoding="utf-8"
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr("zocdoc_ortho.daily_sync.enqueue_url", fake_enqueue)
+    daily = run_daily_sync(workspace, skip_profiles=True, poll_seconds=0.01)
+    assert daily["profiles_queued"] == 0
+
+
+def test_profile_export_migration_preserves_newer_canonical_profile(tmp_path):
+    workspace = Workspace(tmp_path / "workspace").ensure()
+    listing_url = _seed_target(workspace)
+    doctor_url = "https://www.zocdoc.com/doctor/alpha-doctor-md-1"
+    html = _listing_html(
+        listing_url,
+        [("alpha-doctor-md-1", "Alpha Doctor")],
+        advertised_total=1,
+    )
+    path = workspace.listing_dir / "migration-preserve.html"
+    path.write_text(html, encoding="utf-8")
+    with connect(workspace) as conn:
+        _ingest_listing(conn, workspace, listing_url, path, write_outputs=False)
+    bootstrap_from_trace(workspace)
+    with connect(workspace) as conn:
+        conn.execute(
+            """
+            UPDATE canonical_provider_records
+            SET profile_sha256='newer-live-profile',profile_data_json='[{"source":"live"}]',
+                profile_updated_at=?
+            WHERE doctor_url=?
+            """,
+            (now_iso(), doctor_url),
+        )
+        conn.commit()
+
+    export_path = workspace.output_dir / "unique_doctors.csv"
+    with export_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["full_name", "profile_url"])
+        writer.writeheader()
+        writer.writerow({"full_name": "Old Export", "profile_url": doctor_url})
+
+    result = migrate_profiles_from_export(workspace)
+    assert result["imported"] == 0
+    assert result["already_present"] == 1
+    with connect(workspace) as conn:
+        record = conn.execute(
+            "SELECT profile_sha256,profile_data_json FROM canonical_provider_records WHERE doctor_url=?",
+            (doctor_url,),
+        ).fetchone()
+        assert record["profile_sha256"] == "newer-live-profile"
+        assert '"live"' in record["profile_data_json"]

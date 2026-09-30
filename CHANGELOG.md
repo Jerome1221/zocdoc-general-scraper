@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0.dev9.6.1-profile-migration
+
+- Added automatic migration of validated `unique_doctors.csv` records into the canonical provider database during bootstrap.
+- Added `updater migrate-profiles` for workspaces that were bootstrapped before profile migration was available.
+- Changed profile refresh selection to trust canonical profile JSON even when raw profile HTML is no longer retained.
+- Preserved newer live canonical profiles when importing older exports.
+- Added page-location indexes and an indexed bootstrap join to prevent repeated full trace scans.
+- Added regression coverage for migration, cached canonical profiles, and non-destructive import behavior.
+
 ## 0.2.0.dev9.6.0-daily-sync
 
 - Added complete fresh listing recrawls across every discovered pagination page for each selected specialty/location.

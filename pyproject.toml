@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zocdoc-provider-collector"
-version = "0.2.0.dev9+dailyupdater960"
+version = "0.2.0.dev9+dailyupdater961"
 description = "Reusable local pipeline for collecting and parsing Zocdoc provider data across specialties."
 readme = "README.md"
 requires-python = ">=3.11"

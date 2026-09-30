@@ -53,6 +53,11 @@ def init_db(conn: sqlite3.Connection) -> None:
             error TEXT DEFAULT ''
         );
 
+        CREATE INDEX IF NOT EXISTS idx_pages_base_location_url
+            ON pages(base_location_url, url);
+        CREATE INDEX IF NOT EXISTS idx_pages_base_location_status_page
+            ON pages(base_location_url, status, page_no);
+
         CREATE TABLE IF NOT EXISTS doctors (
             doctor_url TEXT PRIMARY KEY,
             doctor_name TEXT DEFAULT '',

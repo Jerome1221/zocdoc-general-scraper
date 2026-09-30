@@ -1,6 +1,6 @@
 # Zocdoc Provider Collector
 
-## Dev9.6 complete daily updater
+## Dev9.6.1 complete daily updater
 
 Dev9.6 turns the Dev9.5 count checker into a complete daily database synchronization path. It reuses the existing managed Chrome runners and parsers, but stages fresh listing captures separately until every pagination page for a location has passed validation.
 
@@ -44,6 +44,14 @@ Seed the canonical membership tables from the listing trace already in that work
 zocdoc-collector --workspace "%WS%" updater bootstrap
 zocdoc-collector --workspace "%WS%" updater status
 ```
+
+Bootstrap also imports validated records from `output\unique_doctors.csv` when that file exists. For a workspace that was already bootstrapped with Dev9.6.0, migrate the existing profile export once without repeating bootstrap:
+
+```bat
+zocdoc-collector --workspace "%WS%" updater migrate-profiles
+```
+
+The migration never opens browser tabs and never overwrites a newer canonical profile. Daily profile selection uses canonical profile data even when the old raw HTML is no longer retained.
 
 Start the existing managed runners:
 
