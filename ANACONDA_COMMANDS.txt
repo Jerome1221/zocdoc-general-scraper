@@ -1,6 +1,10 @@
 DEV9.6 DAILY UPDATER - ANACONDA PROMPT
 =======================================
 
+Current release: 0.2.0.dev9+dailyupdater964. See COMMANDS.md for specialty-only
+bootstrap, resume, offline local profile import and CSV/JSON delivery commands.
+The unfiltered bootstrap below is a full-baseline operation, not a per-specialty requirement.
+
 1. Enter the extracted package and create its venv:
 
 cd /d C:\path\to\zocdoc-provider-collector-0.2.0.dev9.6.0-daily-sync

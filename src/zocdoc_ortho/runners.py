@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -21,7 +24,7 @@ from .workspace import Workspace
 RUNNER_DIR = ".runners"
 CONFIG_NAME = "config.json"
 STATE_NAME = "state.json"
-RUNNER_LAUNCH_VERSION = 3
+RUNNER_LAUNCH_VERSION = 8
 
 
 def _now_iso() -> str:
@@ -38,6 +41,34 @@ def _config_path(workspace: Workspace) -> Path:
 
 def _state_path(workspace: Workspace) -> Path:
     return _runner_root(workspace) / STATE_NAME
+
+
+def _profile_root(workspace: Workspace) -> Path:
+    legacy_root = _runner_root(workspace) / "chrome_profiles"
+    cache_probe = legacy_root / "runner-99" / "GPUPersistentCache" / "DawnGraphiteCache" / ("X" * 40)
+    if os.name != "nt" or len(str(cache_probe.resolve())) < 240:
+        return legacy_root
+
+    user_home = Path(os.environ.get("USERPROFILE") or Path.home())
+    workspace_key = hashlib.sha1(
+        str(workspace.root).lower().encode("utf-8")
+    ).hexdigest()[:12]
+    return user_home / ".zocdoc-collector" / "runner_profiles" / workspace_key
+
+
+def _migrate_profile_paths(workspace: Workspace, config: dict) -> dict:
+    profile_root = _profile_root(workspace)
+    changed = False
+    for runner in config.get("runners", []):
+        profile = (profile_root / str(runner.get("runner_id") or "runner")).resolve()
+        profile.mkdir(parents=True, exist_ok=True)
+        if str(runner.get("profile_dir") or "") != str(profile):
+            runner["profile_dir"] = str(profile)
+            changed = True
+    if changed:
+        config["profile_storage"] = str(profile_root.resolve())
+        _write_json(_config_path(workspace), config)
+    return config
 
 
 def _load_json(path: Path, default: Any) -> Any:
@@ -123,7 +154,7 @@ def init_runners(
 
     workspace.ensure()
     root = _runner_root(workspace)
-    profiles = root / "chrome_profiles"
+    profiles = _profile_root(workspace)
     logs = root / "logs"
     profiles.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
@@ -164,7 +195,7 @@ def load_runner_config(workspace: Workspace) -> dict:
         raise FileNotFoundError(
             f"Runner config not found: {_config_path(workspace)}. Run 'runners init' first."
         )
-    return config
+    return _migrate_profile_paths(workspace, config)
 
 
 def _popen_background(
@@ -180,7 +211,15 @@ def _popen_background(
     Both still receive their own process group.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = log_path.open("ab", buffering=0)
+    try:
+        handle = log_path.open("ab", buffering=0)
+        actual_log_path = log_path
+    except PermissionError:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        actual_log_path = log_path.with_name(
+            f"{log_path.stem}.{stamp}{log_path.suffix}"
+        )
+        handle = actual_log_path.open("ab", buffering=0)
     kwargs: dict[str, Any] = {
         "stdout": handle,
         "stderr": subprocess.STDOUT,
@@ -195,6 +234,7 @@ def _popen_background(
     else:
         kwargs["start_new_session"] = True
     process = subprocess.Popen(command, **kwargs)
+    process.zocdoc_log_path = str(actual_log_path.resolve())
     handle.close()
     return process
 
@@ -376,6 +416,8 @@ def start_runners(
 
         saver_pid = old.get("saver_pid") if _pid_alive(old.get("saver_pid")) else None
         chrome_pid = old.get("chrome_pid") if _pid_alive(old.get("chrome_pid")) else None
+        saver_log = old.get("saver_log") or str((logs_dir / f"{runner_id}.saver.log").resolve())
+        chrome_log = old.get("chrome_log") or str((logs_dir / f"{runner_id}.chrome.log").resolve())
 
         if saver_pid is None:
             saver_cmd = [
@@ -398,6 +440,7 @@ def start_runners(
                 detach_on_windows=True,
             )
             saver_pid = saver_process.pid
+            saver_log = getattr(saver_process, "zocdoc_log_path", saver_log)
 
         controller_page_url = (
             f"http://{runner['host']}:{int(runner['port'])}/controller"
@@ -410,6 +453,9 @@ def start_runners(
                 f"--load-extension={ext}",
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--disable-gpu",
+                "--disable-gpu-shader-disk-cache",
+                "--disable-skia-graphite",
                 "--new-window",
                 controller_page_url,
             ]
@@ -419,6 +465,7 @@ def start_runners(
                 detach_on_windows=False,
             )
             chrome_pid = chrome_process.pid
+            chrome_log = getattr(chrome_process, "zocdoc_log_path", chrome_log)
 
         state_rows.append(
             {
@@ -428,8 +475,8 @@ def start_runners(
                 "saver_pid": saver_pid,
                 "chrome_pid": chrome_pid,
                 "chrome_path": str(resolved_chrome),
-                "saver_log": str((logs_dir / f"{runner_id}.saver.log").resolve()),
-                "chrome_log": str((logs_dir / f"{runner_id}.chrome.log").resolve()),
+                "saver_log": saver_log,
+                "chrome_log": chrome_log,
                 "started_at": old.get("started_at") or _now_iso(),
             }
         )
@@ -546,6 +593,199 @@ def _select_runners(config: dict, status: dict, runner_ids: tuple[str, ...] = ()
     return selected
 
 
+def _progress_specialty_filter(
+    specialties: tuple[str, ...],
+    *,
+    columns: tuple[str, str, str],
+) -> tuple[str, list[str]]:
+    values = [value.strip().lower() for value in specialties if value.strip()]
+    if not values:
+        return "", []
+    placeholders = ",".join("?" for _ in values)
+    clauses = [f"lower({column}) IN ({placeholders})" for column in columns]
+    return " AND (" + " OR ".join(clauses) + ")", values * len(columns)
+
+
+def _listing_progress_snapshot(
+    workspace: Workspace,
+    *,
+    phase: str,
+    specialties: tuple[str, ...],
+) -> dict[str, int]:
+    clause, params = _progress_specialty_filter(
+        specialties,
+        columns=("specialty_slug", "specialty_name", "specialty_url"),
+    )
+    with connect(workspace) as conn:
+        rows = conn.execute(
+            f"SELECT status,COUNT(*) n FROM pages WHERE source=?{clause} GROUP BY status",
+            [phase, *params],
+        ).fetchall()
+    return {str(row["status"]): int(row["n"]) for row in rows}
+
+
+def _profile_progress_cohort(
+    workspace: Workspace,
+    *,
+    specialties: tuple[str, ...],
+) -> frozenset[str] | None:
+    if not specialties:
+        return None
+    if not any(value.strip() for value in specialties):
+        return frozenset()
+    clause, params = _progress_specialty_filter(
+        specialties,
+        columns=("listing_specialty_slug", "listing_specialty_name", "listing_specialty_url"),
+    )
+    # Resolve listing membership once per run, not once per heartbeat.
+    with closing(sqlite3.connect(workspace.db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as conn:
+        return frozenset(
+            row[0] for row in conn.execute(
+                f"SELECT doctor_url FROM listing_provider_trace WHERE 1=1{clause}", params
+            )
+        )
+
+
+def _profile_progress_snapshot(
+    workspace: Workspace,
+    *,
+    specialties: tuple[str, ...],
+    provider_urls: frozenset[str] | None = None,
+) -> dict[str, int]:
+    if provider_urls is None:
+        provider_urls = _profile_progress_cohort(workspace, specialties=specialties)
+    counts: dict[str, int] = {}
+    if provider_urls == frozenset():
+        return counts
+    with closing(sqlite3.connect(workspace.db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as conn:
+        for doctor_url, status in conn.execute("SELECT doctor_url,status FROM doctor_profiles"):
+            if provider_urls is None or doctor_url in provider_urls:
+                counts[str(status)] = counts.get(str(status), 0) + 1
+    return counts
+
+
+def _terminal_progress_count(counts: dict[str, int]) -> int:
+    in_progress = {"pending", "retry_pending", "opening"}
+    return sum(count for status, count in counts.items() if status not in in_progress)
+
+
+def _format_progress_elapsed(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds / 3600:.2f}h"
+
+
+def _print_live_progress(
+    *,
+    kind: str,
+    scope: str,
+    counts: dict[str, int],
+    baseline: dict[str, int],
+    elapsed_seconds: float,
+    active_runners: int,
+    runner_count: int,
+) -> None:
+    processed = max(0, _terminal_progress_count(counts) - _terminal_progress_count(baseline))
+    rate = processed * 60.0 / elapsed_seconds if elapsed_seconds > 0 else 0.0
+    total = sum(counts.values())
+    pending = counts.get("pending", 0) + counts.get("retry_pending", 0)
+    parts = [
+        f"LIVE {kind.upper()}",
+        scope,
+        f"elapsed={_format_progress_elapsed(elapsed_seconds)}",
+        f"runners={active_runners}/{runner_count}",
+        f"this-run={processed:,}",
+        f"rate={rate:.2f}/min",
+        f"total={total:,}",
+        f"saved={counts.get('saved', 0):,}",
+    ]
+    parts.append(f"unavailable={counts.get('unavailable', 0):,}")
+    parts.extend(
+        [
+            f"pending={pending:,}",
+            f"opening={counts.get('opening', 0):,}",
+            f"timeout={counts.get('timeout', 0):,}",
+            f"blocked={counts.get('blocked', 0):,}",
+        ]
+    )
+    print(" | ".join(parts), flush=True)
+
+
+def _wait_for_runner_processes(
+    processes: list[tuple[dict, subprocess.Popen, Path]],
+    *,
+    kind: str,
+    scope: str,
+    started: float,
+    progress_interval_seconds: float,
+    baseline: dict[str, int],
+    snapshot,
+) -> list[dict]:
+    results: list[dict] = []
+    announced: set[str] = set()
+    runner_count = len(processes)
+    interval = max(0.0, float(progress_interval_seconds))
+    next_progress = time.monotonic() + interval if interval else None
+
+    if interval:
+        print(
+            f"LIVE MONITOR | {kind} | {scope} | runners={runner_count} | "
+            f"interval={interval:g}s",
+            flush=True,
+        )
+
+    while True:
+        active = 0
+        for runner, process, log_path in processes:
+            returncode = process.poll()
+            if returncode is None:
+                active += 1
+                continue
+            runner_id = str(runner["runner_id"])
+            if runner_id not in announced:
+                announced.add(runner_id)
+                print(
+                    f"RUNNER EXIT | {runner_id} | code={returncode} | log={log_path}",
+                    flush=True,
+                )
+
+        now = time.monotonic()
+        if next_progress is not None and now >= next_progress:
+            try:
+                counts = snapshot()
+                _print_live_progress(
+                    kind=kind,
+                    scope=scope,
+                    counts=counts,
+                    baseline=baseline,
+                    elapsed_seconds=max(time.monotonic() - started, 0.001),
+                    active_runners=active,
+                    runner_count=runner_count,
+                )
+            except Exception as exc:  # noqa: BLE001 - monitoring must not interrupt worker processes
+                print(f"LIVE {kind.upper()} | status unavailable: {exc}", flush=True)
+            next_progress = time.monotonic() + interval
+
+        if active == 0:
+            break
+        sleep_for = 0.5
+        if next_progress is not None:
+            sleep_for = min(sleep_for, max(0.05, next_progress - time.monotonic()))
+        time.sleep(sleep_for)
+
+    for runner, process, log_path in processes:
+        results.append(
+            {
+                "runner_id": runner["runner_id"],
+                "returncode": process.wait(),
+                "log": str(log_path),
+            }
+        )
+    return results
+
+
 def run_multi_listings(
     workspace: Workspace,
     *,
@@ -563,6 +803,7 @@ def run_multi_listings(
     keep_listing_html: bool = False,
     specialties: tuple[str, ...] = (),
     runner_ids: tuple[str, ...] = (),
+    progress_interval_seconds: float = 15.0,
 ) -> dict:
     config = load_runner_config(workspace)
     status = runner_status(workspace)
@@ -572,6 +813,17 @@ def run_multi_listings(
     logs_dir = _runner_root(workspace) / "logs"
     processes: list[tuple[dict, subprocess.Popen, Path]] = []
     started = time.monotonic()
+    if phase == "auto":
+        from .queue import choose_listing_phase
+
+        progress_phase = choose_listing_phase(workspace, specialties)
+    else:
+        progress_phase = phase
+    baseline = _listing_progress_snapshot(
+        workspace,
+        phase=progress_phase,
+        specialties=specialties,
+    )
 
     for runner, runner_limit in zip(selected_runners, allocations, strict=True):
         if runner_limit <= 0:
@@ -622,16 +874,21 @@ def run_multi_listings(
         handle.close()
         processes.append((runner, process, log_path))
 
-    results = []
-    for runner, process, log_path in processes:
-        returncode = process.wait()
-        results.append(
-            {
-                "runner_id": runner["runner_id"],
-                "returncode": returncode,
-                "log": str(log_path),
-            }
-        )
+    specialty_scope = ",".join(specialties) if specialties else "all-specialties"
+    scope = f"phase={progress_phase} specialty={specialty_scope}"
+    results = _wait_for_runner_processes(
+        processes,
+        kind="listings",
+        scope=scope,
+        started=started,
+        progress_interval_seconds=progress_interval_seconds,
+        baseline=baseline,
+        snapshot=lambda: _listing_progress_snapshot(
+            workspace,
+            phase=progress_phase,
+            specialties=specialties,
+        ),
+    )
 
     with connect(workspace) as conn:
         sync_profiles_from_doctors(conn, workspace, write_output=False)
@@ -671,6 +928,7 @@ def run_multi_profiles(
     stale_claim_minutes: float = 10.0,
     specialties: tuple[str, ...] = (),
     runner_ids: tuple[str, ...] = (),
+    progress_interval_seconds: float = 15.0,
 ) -> dict:
     """Run profile collectors concurrently across selected managed runners.
 
@@ -684,6 +942,12 @@ def run_multi_profiles(
     logs_dir = _runner_root(workspace) / "logs"
     processes: list[tuple[dict, subprocess.Popen, Path]] = []
     started = time.monotonic()
+    if progress_interval_seconds > 0:
+        print("LIVE MONITOR | profiles | preparing specialty membership...", flush=True)
+    provider_urls = _profile_progress_cohort(workspace, specialties=specialties)
+    baseline = _profile_progress_snapshot(
+        workspace, specialties=specialties, provider_urls=provider_urls,
+    )
 
     for runner, runner_limit in zip(selected_runners, allocations, strict=True):
         if runner_limit <= 0:
@@ -692,6 +956,7 @@ def run_multi_profiles(
         handle = log_path.open("wb")
         command = [
             sys.executable,
+            "-u",
             "-m",
             "zocdoc_ortho",
             "--workspace",
@@ -730,16 +995,20 @@ def run_multi_profiles(
         handle.close()
         processes.append((runner, process, log_path))
 
-    results = []
-    for runner, process, log_path in processes:
-        returncode = process.wait()
-        results.append(
-            {
-                "runner_id": runner["runner_id"],
-                "returncode": returncode,
-                "log": str(log_path),
-            }
-        )
+    specialty_scope = ",".join(specialties) if specialties else "all-specialties"
+    results = _wait_for_runner_processes(
+        processes,
+        kind="profiles",
+        scope=f"specialty={specialty_scope}",
+        started=started,
+        progress_interval_seconds=progress_interval_seconds,
+        baseline=baseline,
+        snapshot=lambda: _profile_progress_snapshot(
+            workspace,
+            specialties=specialties,
+            provider_urls=provider_urls,
+        ),
+    )
 
     with connect(workspace) as conn:
         export_profile_queue(conn, workspace)

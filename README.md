@@ -1,5 +1,20 @@
 # Zocdoc Provider Collector
 
+## Offline imports and delivery (dailyupdater964)
+
+See [COMMANDS.md](COMMANDS.md) for the current Anaconda Prompt workflow.
+
+- `updater bootstrap --specialty psychiatrists` imports only the selected specialty. Without a filter, it still imports all specialties.
+- Each location commits separately, with progress output. After interruption, use `--resume-run-id N` to skip committed locations in the original run scope.
+- `--skip-profiles` imports memberships only, without parsing profiles or preparing profile jobs.
+- `updater import-local-profiles --run-id N --specialty psychiatrists` parses retained HTML without opening tabs. Existing canonical details and unavailable profiles are skipped. Default commits are ten attempted profiles per batch; `--batch-size 1` gives per-profile durability.
+- `updater reconcile-run --run-id N` previews historical run bookkeeping. `--apply` records interruption with actual committed counters; it never declares collection complete.
+- `export-delivery --specialty psychiatrists --output C:\deliveries\psychiatrists` writes matching CSV/JSON datasets and a ZIP, without changing the database. The output folder must not already exist. Only ready specialties enter the ZIP; exit code 2 means review is required.
+
+Stop other updater/import workers before resume or reconciliation. New commands use the same updater lock. A stale run record is not proof of a live process. Do not delete database WAL/SHM files while any process uses the database.
+
+The default free-space guard is 3 GiB (`--min-free-gb`); it is a stop threshold, not a guarantee that an entire run will fit. Bootstrap and profile imports never free disk space. Retained HTML can be needed for repair or legacy exports even after some canonical details exist.
+
 ## Dev9.6.1 complete daily updater
 
 Dev9.6 turns the Dev9.5 count checker into a complete daily database synchronization path. It reuses the existing managed Chrome runners and parsers, but stages fresh listing captures separately until every pagination page for a location has passed validation.
@@ -839,6 +854,29 @@ Resume only after normal site access has been restored and the restriction has b
 
 The package does not provide restriction-bypass tooling.
 
+If an iframe-based verification challenge was saved by an older package, audit and
+repair only the affected specialty with:
+
+```bat
+zocdoc-collector --workspace .\workspace repair-profile-challenges --specialty radiologists --dry-run
+zocdoc-collector --workspace .\workspace repair-profile-challenges --specialty radiologists
+```
+
+The repair moves challenge HTML into `captured/profile_challenges/` and resets only
+those profile queue rows to `pending`; it does not repeat listing collection.
+
+If a provider URL redirected and an older saver stored the valid HTML under the
+final canonical URL, reconcile it without another browser request:
+
+```bat
+zocdoc-collector --workspace .\workspace repair-profile-redirects --specialty oncologists --dry-run
+zocdoc-collector --workspace .\workspace repair-profile-redirects --specialty oncologists
+```
+
+Future captures preserve the requested URL as the queue identity and record the
+final URL in `output/profile_url_redirects.csv`. Profile exports use the canonical
+URL embedded in the page.
+
 ---
 
 # Data safety and Git
@@ -1233,4 +1271,47 @@ zocdoc-collector --workspace C:\z9test repair-trace-partials --delete-html
 
 ## Dev9.4.2 profile capture and timing
 
+Confirmed profile `/404` and `Not Found. Redirecting to /` responses are terminal
+`unavailable` results. Bootstrap and daily runs keep that status even when canonical
+profile details are missing. Historical canonical details and listing memberships
+remain available. Reports show **Collection resolved** separately from **All profiles saved**.
+
+To explicitly recheck a bounded set of unavailable jobs, choose a run and limit;
+the optional repeatable specialty filter also applies:
+
+```bat
+zocdoc-collector --workspace .\workspace_test updater profiles --run-id 123 --specialty dentists --retry-unavailable --limit 10
+```
+
+`--retry-unavailable` requires `--limit` and captures only the matching unavailable
+jobs. A successful recheck restores `saved`; a failed recheck keeps the confirmed
+unavailable profile status. Without `--run-id`, the latest run with eligible queue
+statuses is selected.
+
 Dev9.4.2 aligns the Chrome extension profile recognizer with the Python profile recognizer, so valid no-ID profile URLs and `Claim your profile` pages save and close normally instead of waiting for profile timeout. It also prints stage timing for browser/capture, listing ingest/trace, profile queue updates, and final export parsing. See `docs/release-0.2.0.dev9-profilecapture42.md`.
+
+## Listing 404 exceptions
+
+Explicit Zocdoc listing 404 pages are terminal `unavailable` captures across all
+specialties. They are not saved listings or valid empty results. Retained HTML and
+historical provider traces remain available; normal collection does not retry
+these pages automatically. Ambiguous zero-link pages and challenges still follow
+the existing retry/review workflow.
+
+Reports separate **Listing resolved** (no outstanding attempts) from **Listing
+complete** (no unavailable exceptions). **Collection resolved** also requires
+every discovered provider profile to be saved or confirmed unavailable. These
+flags do not establish exhaustive nationwide coverage.
+
+Classify previously retained 404 captures without browser requests:
+
+```bat
+zocdoc-collector --workspace "%WS%" repair-listing-unavailable --specialty ear-nose-throat-doctors --dry-run
+zocdoc-collector --workspace "%WS%" repair-listing-unavailable --specialty ear-nose-throat-doctors
+```
+
+Omit `--specialty` to inspect all specialties, or repeat it to select several.
+Repairs create a SQLite backup first and skip actively opening rows. They do not
+change provider records or memberships. The daily updater rejects a location crawl
+containing a 404, retains its evidence, and proceeds to other locations without
+inferring provider removals from that incomplete crawl.

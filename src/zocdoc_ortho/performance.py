@@ -11,7 +11,6 @@ from pathlib import Path
 
 from .workspace import Workspace
 
-
 STAGE_TIMING_FIELDS = [
     "navigation_seconds",
     "stabilization_seconds",
@@ -207,13 +206,13 @@ class PerformanceRecorder:
         # any individual page duration, so this preserves real throughput.
         throughput_elapsed = max(elapsed, max(durations, default=0.0))
         stage_averages: dict[str, float | str] = {}
-        for field in STAGE_TIMING_FIELDS:
+        for stage_field in STAGE_TIMING_FIELDS:
             values = [
-                float(row[field])
+                float(row[stage_field])
                 for row in self.events
-                if row.get(field) not in {None, ""}
+                if row.get(stage_field) not in {None, ""}
             ]
-            stage_averages[f"avg_{field}"] = round(statistics.fmean(values), 4) if values else ""
+            stage_averages[f"avg_{stage_field}"] = round(statistics.fmean(values), 4) if values else ""
 
         summary = {
             "run_id": self.run_id,

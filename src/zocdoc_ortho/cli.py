@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from . import __version__
 from .daily_sync import (
     bootstrap_from_trace,
     daily_sync_lock,
@@ -26,6 +27,8 @@ from .outputs import export_page_outputs
 from .performance import performance_report
 from .postgres_sync import publish_to_postgres
 from .profile import parse_profile_rows
+from .profile_challenges import repair_profile_challenges
+from .profile_redirects import repair_profile_redirects
 from .queue import (
     audit_zero_link_listings,
     choose_listing_phase,
@@ -34,6 +37,7 @@ from .queue import (
     collect_profile_batch,
     print_status,
     reconcile_existing_files,
+    repair_unavailable_listings,
     reset_statuses,
 )
 from .runners import (
@@ -115,6 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Mutable workspace directory. Default: $ZOCDOC_WORKSPACE or ./workspace",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="Create the workspace directories and database")
@@ -154,6 +159,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Select only locations that already have a successful snapshot",
     )
     updater_sub.add_parser("check", help="Compare current counts against latest snapshots and queue refreshes")
+    delivery_parser = sub.add_parser("export-delivery", help="Read-only specialty CSV/JSON delivery in the orthopedic schema")
+    delivery_parser.add_argument("--specialty", action="append", required=True)
+    delivery_parser.add_argument("--output", type=Path, required=True)
     updater_queue = updater_sub.add_parser("queue", help="View pending updater refresh jobs")
     updater_queue.add_argument("--status", default=None, help="Optional queue status filter")
     updater_queue.add_argument("--limit", type=int, default=50, help="Maximum queue rows to print")
@@ -162,10 +170,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the complete listing, provider-diff, profile, and database update workflow",
     )
     _add_daily_arguments(updater_daily)
-    updater_sub.add_parser(
+    updater_bootstrap = updater_sub.add_parser(
         "bootstrap",
         help="Seed canonical provider memberships from already parsed listing trace data",
     )
+    updater_bootstrap.add_argument("--specialty", action="append", default=[])
+    updater_bootstrap.add_argument("--resume-run-id", type=int)
+    updater_bootstrap.add_argument("--skip-profiles", action="store_true", help="Import memberships only; defer profile imports and queue preparation")
+    updater_bootstrap.add_argument("--min-free-gb", type=float, default=3)
+    updater_local = updater_sub.add_parser("import-local-profiles", help="Import retained HTML locally; never open browser tabs")
+    updater_local.add_argument("--run-id", type=int, required=True)
+    updater_local.add_argument("--specialty", action="append", default=[])
+    updater_local.add_argument("--limit", type=int)
+    updater_local.add_argument("--batch-size", type=int, default=10)
+    updater_local.add_argument("--min-free-gb", type=float, default=3)
+    updater_local.add_argument("--dry-run", action="store_true")
+    updater_reconcile = updater_sub.add_parser("reconcile-run", help="Report a stopped run; --apply records interruption, not completion")
+    updater_reconcile.add_argument("--run-id", type=int, required=True)
+    updater_reconcile.add_argument("--apply", action="store_true")
     updater_migrate_profiles = updater_sub.add_parser(
         "migrate-profiles",
         help="Import existing unique_doctors.csv profiles without browser requests",
@@ -183,8 +205,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     updater_profiles.add_argument("--run-id", type=int, default=None)
     updater_profiles.add_argument("--runner", action="append", default=[])
+    updater_profiles.add_argument(
+        "--specialty",
+        action="append",
+        default=[],
+        help="Optional repeatable specialty slug/name filter",
+    )
+    updater_profiles.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Reset failed jobs matching this run and specialty filter before capture",
+    )
+    updater_profiles.add_argument(
+        "--reset-failed-only",
+        action="store_true",
+        help="Reset failed jobs matching this run and specialty filter without capturing",
+    )
     updater_profiles.add_argument("--limit", type=int, default=None)
+    updater_profiles.add_argument(
+        "--retry-unavailable", action="store_true",
+        help="Explicitly recheck unavailable jobs in this run/specialty; requires --limit",
+    )
     updater_profiles.add_argument("--concurrency-per-runner", type=int, default=3)
+    updater_profiles.add_argument(
+        "--stagger",
+        type=float,
+        default=2.0,
+        help="Seconds to wait between profile launches on each runner",
+    )
     updater_profiles.add_argument("--timeout", type=float, default=60.0)
     updater_profiles.add_argument("--poll", type=float, default=0.2)
     updater_profiles.add_argument("--capture-retries", type=int, default=2)
@@ -367,6 +415,12 @@ def build_parser() -> argparse.ArgumentParser:
     multi_listing.add_argument("--stable-checks", type=int, default=2)
     multi_listing.add_argument("--page-max-wait-ms", type=int, default=8000)
     multi_listing.add_argument("--controller-poll-ms", type=int, default=200)
+    multi_listing.add_argument(
+        "--progress-interval",
+        type=float,
+        default=15.0,
+        help="Print a live multi-runner progress summary every N seconds; use 0 to disable",
+    )
     multi_listing.add_argument("--zero-link-max-retries", type=int, default=2)
     multi_listing.add_argument(
         "--keep-listing-html",
@@ -397,6 +451,12 @@ def build_parser() -> argparse.ArgumentParser:
     multi_profiles.add_argument("--stable-checks", type=int, default=3)
     multi_profiles.add_argument("--page-max-wait-ms", type=int, default=12000)
     multi_profiles.add_argument("--controller-poll-ms", type=int, default=200)
+    multi_profiles.add_argument(
+        "--progress-interval",
+        type=float,
+        default=15.0,
+        help="Print a live multi-runner progress summary every N seconds; use 0 to disable",
+    )
     multi_profiles.add_argument("--stale-claim-minutes", type=float, default=10.0)
     multi_profiles.add_argument(
         "--specialty",
@@ -422,6 +482,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audit saved zero-link listing pages and schedule suspicious captures for a later retry",
     )
     retry_zero.add_argument("--max-retries", type=int, default=2)
+
+    repair_challenges = sub.add_parser(
+        "repair-profile-challenges",
+        help="Quarantine verification captures and reset their profile rows to pending",
+    )
+    repair_challenges.add_argument(
+        "--specialty",
+        action="append",
+        default=[],
+        help="Optional repeatable specialty slug/name/URL filter",
+    )
+    repair_challenges.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report challenge captures without moving files or changing SQLite",
+    )
+
+    repair_redirects = sub.add_parser(
+        "repair-profile-redirects",
+        help="Reconcile profile files saved under a redirected canonical URL",
+    )
+    repair_redirects.add_argument(
+        "--specialty",
+        action="append",
+        default=[],
+        help="Optional repeatable specialty slug/name/URL filter",
+    )
+    repair_redirects.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report redirect matches without changing SQLite",
+    )
+
+    repair_listings = sub.add_parser(
+        "repair-listing-unavailable", help="Classify archived listing 404s; back up SQLite before repair",
+    )
+    repair_listings.add_argument("--specialty", action="append", default=[])
+    repair_listings.add_argument("--dry-run", action="store_true")
 
     retry = sub.add_parser("retry", help="Reset interrupted/timeout/review queue rows to pending")
     retry.add_argument("--target", choices=["listings", "profiles", "specialty-pages"], required=True)
@@ -469,6 +567,53 @@ def _format_runtime(seconds: float | None) -> str:
     return f"{minutes / 60.0:.2f}h"
 
 
+def _status_text(counts: dict[str, int]) -> str:
+    preferred = (
+        "saved",
+        "valid_empty",
+        "unavailable",
+        "pending",
+        "opening",
+        "retry_pending",
+        "review",
+        "timeout",
+        "blocked",
+        "missing",
+    )
+    parts = [
+        f"{status}={int(counts.get(status, 0)):,}"
+        for status in preferred
+        if counts.get(status, 0)
+    ]
+    return " ".join(parts) if parts else "none"
+
+
+def _print_selected_specialty_status(workspace: Workspace, selectors: tuple[str, ...]) -> None:
+    if not selectors:
+        return
+    print("=" * 72)
+    print("SELECTED SPECIALTY STATUS")
+    print("=" * 72)
+    for index, selector in enumerate(selectors):
+        report = specialty_runtime_report(workspace, selector)
+        specialty = report["specialty"]
+        if index:
+            print("-")
+        print(f"Specialty             : {specialty['specialty_name']} ({specialty['specialty_slug']})")
+        print(f"Location targets      : {report['targets']:,}")
+        print(f"Base pages            : {_status_text(report['page_counts'].get('seed', {}))}")
+        print(f"Pagination pages      : {_status_text(report['page_counts'].get('pagination', {}))}")
+        print(f"Providers in listings : {report['providers']:,} unique")
+        print(f"First discovered here : {report['first_seen_providers']:,}")
+        print(f"Previously known      : {report['previously_known_providers']:,}")
+        print(f"All provider profiles : {_status_text(report['all_profile_counts'])}")
+        print(f"Listing complete      : {'yes' if report['listing_complete'] else 'no'}")
+        print(f"Listing resolved      : {'yes' if report['listing_resolved'] else 'no'}")
+        print(f"All profiles saved    : {'yes' if report['profiles_complete'] else 'no'}")
+        print(f"Collection resolved   : {'yes' if report['collection_resolved'] else 'no'}")
+    print("=" * 72)
+
+
 def _format_stage_timing_summary(timings: dict | None, *, profile: bool = False) -> str:
     timings = timings or {}
     fields = [
@@ -509,6 +654,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         command = args.command
+        if command == "export-delivery":
+            from .delivery import main as export_delivery
+            options = ["--workspace", str(workspace.root), "--output", str(args.output)]
+            for specialty in args.specialty:
+                options.extend(["--specialty", specialty])
+            return export_delivery(options)
+
         if command == "init":
             with connect(workspace):
                 pass
@@ -590,7 +742,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 0 if result["status"] == "complete" else 2
 
             if args.updater_command == "bootstrap":
-                result = bootstrap_from_trace(workspace)
+                result = bootstrap_from_trace(workspace, specialties=tuple(args.specialty),
+                    resume_run_id=args.resume_run_id, skip_profiles=args.skip_profiles, min_free_gb=args.min_free_gb)
                 print("=" * 72)
                 print("CANONICAL DATABASE BOOTSTRAP")
                 print("=" * 72)
@@ -602,6 +755,20 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Profiles queued        : {result['profiles_queued']:,}")
                 print("No browser requests were made.")
                 print("=" * 72)
+                return 0
+
+            if args.updater_command == "import-local-profiles":
+                from .local_profiles import import_local_profiles
+                result = import_local_profiles(workspace, run_id=args.run_id, specialties=tuple(args.specialty),
+                    limit=args.limit, batch_size=args.batch_size, min_free_gb=args.min_free_gb, dry_run=args.dry_run)
+                print("LOCAL RESULT | " + json.dumps(result), flush=True)
+                print("No browser requests were made; memberships and collector statuses were preserved.")
+                return 2 if result["rejected"] or result["missing_html"] else 0
+
+            if args.updater_command == "reconcile-run":
+                from .run_reconciliation import reconcile_interrupted_run
+                result = reconcile_interrupted_run(workspace, run_id=args.run_id, apply=args.apply)
+                print("RUN RECONCILIATION | " + json.dumps(result), flush=True)
                 return 0
 
             if args.updater_command == "migrate-profiles":
@@ -653,8 +820,13 @@ def main(argv: list[str] | None = None) -> int:
                     workspace,
                     run_id=args.run_id,
                     runner_ids=tuple(args.runner),
+                    specialties=tuple(args.specialty),
+                    retry_failed=args.retry_failed,
+                    retry_unavailable=args.retry_unavailable,
+                    reset_failed_only=args.reset_failed_only,
                     limit=args.limit,
                     concurrency_per_runner=args.concurrency_per_runner,
+                    stagger_seconds=args.stagger,
                     timeout_seconds=args.timeout,
                     poll_seconds=args.poll,
                     capture_retries=args.capture_retries,
@@ -662,7 +834,8 @@ def main(argv: list[str] | None = None) -> int:
                 batch = result["profile_batch"]
                 print(
                     f"Profile run {result['id']}: selected={batch['selected']:,} "
-                    f"saved={batch['saved']:,} failed={batch['failed']:,} "
+                    f"saved={batch['saved']:,} unavailable={batch.get('unavailable', 0):,} "
+                    f"failed={batch['failed']:,} "
                     f"remaining={result.get('profiles_pending', 0):,}"
                 )
                 return 0 if not result.get("profiles_pending") and not batch["failed"] else 2
@@ -891,6 +1064,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Processed this run: {count:,} listing page(s)")
             print(f"Elapsed this step : {_format_runtime(step_elapsed)}")
             print_status(workspace)
+            _print_selected_specialty_status(workspace, selectors)
             return 0
 
         if command == "perf-report":
@@ -920,9 +1094,9 @@ def main(argv: list[str] | None = None) -> int:
             log_path = workspace.output_dir / "trace_progress.log"
 
             def trace_log(event: dict) -> None:
-                from datetime import datetime
+                from datetime import UTC, datetime
 
-                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                stamp = datetime.now(UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
                 kind = event.get("event")
                 if kind == "start":
                     message = (
@@ -1093,6 +1267,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Processed this run: {count:,} unique doctor profile(s)")
             print(f"Elapsed this step : {_format_runtime(step_elapsed)}")
             print_status(workspace)
+            _print_selected_specialty_status(workspace, selectors)
             return 0
 
         if command == "runners":
@@ -1192,6 +1367,7 @@ def main(argv: list[str] | None = None) -> int:
                 keep_listing_html=args.keep_listing_html,
                 specialties=selectors,
                 runner_ids=tuple(args.runner),
+                progress_interval_seconds=args.progress_interval,
             )
             combined = result["combined"]
             if len(args.specialty) == 1 and resolved_phase in {"seed", "pagination"}:
@@ -1221,6 +1397,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  {failure['runner_id']}: {failure['log']}")
                 return 1
             print_status(workspace)
+            _print_selected_specialty_status(workspace, selectors)
             return 0
 
         if command == "multi-profiles":
@@ -1239,6 +1416,7 @@ def main(argv: list[str] | None = None) -> int:
                 stale_claim_minutes=args.stale_claim_minutes,
                 specialties=tuple(args.specialty),
                 runner_ids=tuple(args.runner),
+                progress_interval_seconds=args.progress_interval,
             )
             combined = result["combined"]
             if len(args.specialty) == 1:
@@ -1267,6 +1445,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  {failure['runner_id']}: {failure['log']}")
                 return 1
             print_status(workspace)
+            _print_selected_specialty_status(workspace, tuple(args.specialty))
             return 0
 
         if command == "specialty-runtime":
@@ -1279,6 +1458,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Location targets      : {report['targets']:,}")
             print(f"Unique providers seen : {report['providers']:,}")
             print(f"New-to-run providers  : {report['first_seen_providers']:,}")
+            print(f"Previously known      : {report['previously_known_providers']:,}")
+            print(f"Base page status      : {_status_text(report['page_counts'].get('seed', {}))}")
+            print(f"Pagination status     : {_status_text(report['page_counts'].get('pagination', {}))}")
+            print(f"All profile status    : {_status_text(report['all_profile_counts'])}")
+            print(f"Listing resolved      : {'yes' if report['listing_resolved'] else 'no'}")
+            print(f"Listing complete      : {'yes' if report['listing_complete'] else 'no'}")
+            print(f"All profiles saved    : {'yes' if report['profiles_complete'] else 'no'}")
+            print(f"Collection resolved   : {'yes' if report['collection_resolved'] else 'no'}")
             print("-")
             labels = {
                 "target_discovery": "Target discovery",
@@ -1313,6 +1500,54 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Quarantine folder  : {workspace.rejected_listing_dir}")
             print("=" * 72)
             print_status(workspace)
+            return 0
+
+        if command == "repair-profile-challenges":
+            result = repair_profile_challenges(
+                workspace,
+                specialties=tuple(args.specialty),
+                dry_run=args.dry_run,
+            )
+            print("=" * 72)
+            print("PROFILE CHALLENGE REPAIR")
+            print("=" * 72)
+            print(f"Saved profiles scanned : {result['scanned']:,}")
+            print(f"Challenges detected    : {result['challenged']:,}")
+            print(f"Profiles reset         : {result['reset']:,}")
+            print(f"Missing profile files  : {result['missing']:,}")
+            print(f"Mode                   : {'dry run' if result['dry_run'] else 'applied'}")
+            print(f"Quarantine directory   : {result['quarantine_dir']}")
+            print("=" * 72)
+            return 0
+
+        if command == "repair-listing-unavailable":
+            result = repair_unavailable_listings(
+                workspace, specialties=tuple(args.specialty), dry_run=args.dry_run,
+            )
+            for item in result["matches"]:
+                print(f"LISTING 404 | {item['url']} | {item['reason']} | evidence={item['evidence']}")
+            print(f"Examined={result['examined']} matched={len(result['matches'])} repaired={result['repaired']} dry_run={result['dry_run']}")
+            if result["backup"]:
+                print(f"BACKUP: {result['backup']}")
+            return 0
+
+        if command == "repair-profile-redirects":
+            result = repair_profile_redirects(
+                workspace,
+                specialties=tuple(args.specialty),
+                dry_run=args.dry_run,
+            )
+            print("=" * 72)
+            print("PROFILE REDIRECT REPAIR")
+            print("=" * 72)
+            print(f"Unresolved profiles scanned : {result['scanned']:,}")
+            print(f"Redirect captures matched   : {result['matched']:,}")
+            print(f"Profiles repaired           : {result['repaired']:,}")
+            print(f"Ambiguous matches           : {result['ambiguous']:,}")
+            print(f"Missing profile files       : {result['missing']:,}")
+            print(f"Challenge captures skipped  : {result['challenged']:,}")
+            print(f"Mode                        : {'dry run' if result['dry_run'] else 'applied'}")
+            print("=" * 72)
             return 0
 
         if command == "retry":

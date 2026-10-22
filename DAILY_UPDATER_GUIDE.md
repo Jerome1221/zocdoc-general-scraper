@@ -1,5 +1,7 @@
 # Daily Updater Guide
 
+For the current specialty-scoped offline import, resume, interrupted-run reconciliation and CSV/JSON delivery commands, use [COMMANDS.md](COMMANDS.md). The full unfiltered bootstrap examples below remain available but are not necessary after every completed specialty.
+
 This is the operational path for Dev9.6. It is the same synchronization engine for a five-location test and a complete all-target run; `--limit` changes only how many locations are selected.
 
 ## 1. Install

@@ -1,4 +1,7 @@
 (() => {
+  if (globalThis.__zocdocCaptureScriptLoaded) return;
+  globalThis.__zocdocCaptureScriptLoaded = true;
+
   const FALLBACK = { check_ms: 500, stable_checks: 3, max_wait_ms: 12000 };
   const path = location.pathname.replace(/\/+$/, "");
 
@@ -20,6 +23,9 @@
 
   const isSpecialtyIndex = path === "/specialty";
   const isProfile = isProfilePath(path);
+  const unavailableRoute = path === "/404" || (
+    path === "" && /not found\.?\s*redirecting to\s*\/(?:\s|$|[.])/i.test(document.body?.innerText || "")
+  );
   const isSpecialtyLanding =
     !isSpecialtyIndex &&
     !isProfile &&
@@ -33,6 +39,7 @@
       !!document.querySelector('[data-test="selection-criteria-header"]'));
 
   const pageType =
+    unavailableRoute ? "profile" :
     isSpecialtyIndex ? "specialty_index" :
     isSpecialtyLanding ? "specialty_landing" :
     isListing ? "listing" :
@@ -53,6 +60,7 @@
   const scriptStarted = performance.now();
   const navigationTiming = performance.getEntriesByType("navigation")[0];
   const navigationToContentScriptMs = Math.max(0, scriptStarted);
+  let captureFinished = false;
 
   function send(type, payload) {
     chrome.runtime.sendMessage({ type, payload }, (response) => {
@@ -68,13 +76,67 @@
     return (document.body?.innerText || "").toLowerCase();
   }
 
+  function elementVisible(element) {
+    if (!element || element.hidden) return false;
+    const style = window.getComputedStyle(element);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      Number(style.opacity) === 0
+    ) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.width > 1 && rect.height > 1;
+  }
+
+  function challengeFrameVisible() {
+    const frames = document.querySelectorAll([
+      'iframe[src*="captcha-delivery.com"]',
+      'iframe[src*="datadome"]'
+    ].join(","));
+    return Array.from(frames).some(elementVisible);
+  }
+
+  function profileContentReady() {
+    if (pageType !== "profile") return false;
+    const name = document.querySelector('[data-test="provider-name"]');
+    return !!name && (name.textContent || "").trim().length > 0;
+  }
+
+  function blockingChallengeFrame() {
+    return challengeFrameVisible() && !profileContentReady();
+  }
+
   function blocked() {
-    const text = bodyTextLower();
-    return blockTerms.some((term) => text.includes(term));
+    let text = bodyTextLower();
+    if (profileContentReady()) {
+      // Reviews can mention restriction keywords without being a challenge page.
+      const notices = document.querySelectorAll('h1,h2,h3,[role="alert"],[role="dialog"]');
+      text = Array.from(notices)
+        .filter((node) => elementVisible(node) && !node.closest(
+          '[data-test*="review"],[data-testid*="review"]'
+        ))
+        .map((node) => node.innerText || node.textContent || "")
+        .join("\n").toLowerCase();
+    }
+    if (/enable\s+(?:javascript|js)\s+and\s+disable\s+(?:any\s+|your\s+|the\s+)?ad[\s-]*block(?:er|ers|ing)?/i.test(text)) return true;
+    if (blockTerms.some((term) => text.includes(term))) return true;
+    return blockingChallengeFrame();
   }
 
   function claimProfileVisible() {
     return pageType === "profile" && bodyTextLower().includes("claim your profile");
+  }
+
+  function profileUnavailableReason() {
+    if (pageType !== "profile") return "";
+    const text = bodyTextLower();
+    if (path === "/404" || /not found\.?\s*redirecting to\s*\/404\b/.test(text)) {
+      return "zocdoc_profile_404";
+    }
+    if (/not found\.?\s*redirecting to\s*\/(?:\s|$|[.])/.test(text)) return "zocdoc_profile_not_found";
+    return "";
   }
 
   function readinessSignature() {
@@ -114,11 +176,17 @@
   }
 
   function capture({ started, stableCount, signature, reason, checks }) {
+    if (captureFinished) return;
+    captureFinished = true;
+
     if (blocked()) {
       send("PAGE_BLOCKED", {
         url: location.href,
         title: document.title,
-        text: (document.body?.innerText || "").slice(0, 3000)
+        text: (
+          (blockingChallengeFrame() ? "Verification challenge frame detected.\n\n" : "") +
+          (document.body?.innerText || "")
+        ).slice(0, 3000)
       });
       return;
     }
@@ -151,6 +219,23 @@
     });
   }
 
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "PING_CAPTURE_SCRIPT") {
+      sendResponse({ ok: true, captured: captureFinished, url: location.href });
+      return;
+    }
+    if (message?.type === "FORCE_CAPTURE") {
+      capture({
+        started: scriptStarted,
+        stableCount: 0,
+        signature: readinessSignature(),
+        reason: "background_watchdog",
+        checks: 0
+      });
+      sendResponse({ ok: true, captured: captureFinished, url: location.href });
+    }
+  });
+
   function start(config) {
     const checkMs = Math.max(50, Number(config?.check_ms || FALLBACK.check_ms));
     const stableRequired = Math.max(1, Number(config?.stable_checks || FALLBACK.stable_checks));
@@ -162,6 +247,18 @@
 
     const timer = setInterval(() => {
       checks += 1;
+      const unavailable = profileUnavailableReason();
+      if (unavailable) {
+        clearInterval(timer);
+        capture({
+          started,
+          stableCount,
+          signature: unavailable,
+          reason: "profile_unavailable",
+          checks
+        });
+        return;
+      }
       if (blocked()) {
         clearInterval(timer);
         capture({ started, stableCount, signature: lastSignature, reason: "blocked", checks });

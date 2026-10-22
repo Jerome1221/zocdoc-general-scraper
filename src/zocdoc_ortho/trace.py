@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from collections.abc import Iterable
+from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pandas as pd
 
@@ -21,9 +24,43 @@ def find_listing_html(workspace: Workspace, url: str) -> Path | None:
     return path if path.exists() else None
 
 
+@lru_cache(maxsize=8)
+def _profile_files_by_provider_id(
+    profile_dir_value: str,
+    directory_mtime_ns: int,
+) -> dict[str, Path]:
+    del directory_mtime_ns
+    profile_dir = Path(profile_dir_value)
+    indexed: dict[str, Path] = {}
+    for candidate in profile_dir.glob("*.html"):
+        match = re.search(r"-(\d+)--[0-9a-f]{8}\.html$", candidate.name, flags=re.IGNORECASE)
+        if not match:
+            continue
+        provider_id = match.group(1)
+        existing = indexed.get(provider_id)
+        if existing is None or (candidate.stat().st_mtime_ns, candidate.name) > (
+            existing.stat().st_mtime_ns,
+            existing.name,
+        ):
+            indexed[provider_id] = candidate
+    return indexed
+
+
 def find_profile_html(workspace: Workspace, url: str) -> Path | None:
-    path = workspace.profile_dir / safe_slug(normalize_url(url))
-    return path if path.exists() else None
+    normalized = normalize_url(url)
+    path = workspace.profile_dir / safe_slug(normalized)
+    if path.exists():
+        return path
+
+    match = re.search(r"-(\d+)$", urlsplit(normalized).path.rstrip("/"))
+    if not match:
+        return None
+    profile_dir = workspace.profile_dir
+    index = _profile_files_by_provider_id(
+        str(profile_dir.resolve()),
+        profile_dir.stat().st_mtime_ns,
+    )
+    return index.get(match.group(1))
 
 
 def trace_rows_for_doctor(conn: sqlite3.Connection, doctor_url: str) -> list[dict]:
@@ -571,7 +608,7 @@ def rebuild_listing_trace(
             # deleted before this commit succeeds.
             conn.commit()
             if delete_html and pending_deletes:
-                for url, path in list(pending_deletes):
+                for url, path in pending_deletes:
                     if not path.exists():
                         continue
                     path.unlink()

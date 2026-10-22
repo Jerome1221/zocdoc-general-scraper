@@ -4,6 +4,7 @@ from pathlib import Path
 
 from zocdoc_ortho.db import connect
 from zocdoc_ortho.queue import _claim_pending_profile
+from zocdoc_ortho.runners import _profile_progress_snapshot
 from zocdoc_ortho.specialty_runtime import append_specialty_runtime, specialty_runtime_report
 from zocdoc_ortho.utils import now_iso
 from zocdoc_ortho.workspace import Workspace
@@ -128,14 +129,28 @@ def test_specialty_runtime_report_projects_partial_run(tmp_path: Path):
     assert report["targets"] == 1
     assert report["providers"] == 1
     assert report["first_seen_providers"] == 1
+    assert report["previously_known_providers"] == 0
+    assert report["all_profile_counts"] == {"pending": 1}
+    assert report["listing_complete"] is True
+    assert report["profiles_complete"] is False
     base = next(row for row in report["steps"] if row["step"] == "base_listings")
     assert base["rate_per_minute"] == 2.0
     assert base["projected_full_seconds"] == 30.0
 
 
-def test_profile_specialty_filter_claims_only_first_seen_specialty(tmp_path: Path):
+def test_profile_specialty_filter_uses_listing_membership_not_first_seen_specialty(tmp_path: Path):
     workspace = Workspace(tmp_path / "workspace").ensure()
     _seed_specialty(workspace)
+    with connect(workspace) as conn:
+        conn.execute(
+            """
+            UPDATE doctors
+            SET first_seen_specialty_name='Cardiologists',
+                first_seen_specialty_url='https://www.zocdoc.com/cardiologists'
+            """
+        )
+        conn.commit()
+
     claimed = _claim_pending_profile(workspace, "runner-01", ("dentists",))
     assert claimed is not None
     assert claimed["doctor_url"].endswith("test-dentist-123")
@@ -147,6 +162,36 @@ def test_profile_specialty_filter_claims_only_first_seen_specialty(tmp_path: Pat
         )
         conn.commit()
     assert _claim_pending_profile(workspace, "runner-01", ("cardiologists",)) is None
+
+
+def test_profile_progress_uses_listing_membership_not_first_seen_specialty(tmp_path: Path):
+    workspace = Workspace(tmp_path / "workspace").ensure()
+    _seed_specialty(workspace)
+    with connect(workspace) as conn:
+        conn.execute(
+            """
+            UPDATE doctors
+            SET first_seen_specialty_name='Cardiologists',
+                first_seen_specialty_url='https://www.zocdoc.com/cardiologists'
+            """
+        )
+        conn.commit()
+
+    assert _profile_progress_snapshot(workspace, specialties=("dentists",)) == {
+        "pending": 1
+    }
+    assert _profile_progress_snapshot(workspace, specialties=("cardiologists",)) == {}
+
+
+def test_runtime_reports_unavailable_as_resolved_without_all_profiles_saved(tmp_path: Path):
+    workspace = Workspace(tmp_path / "workspace").ensure()
+    _seed_specialty(workspace)
+    with connect(workspace) as conn:
+        conn.execute("UPDATE doctor_profiles SET status='unavailable'")
+        conn.commit()
+    report = specialty_runtime_report(workspace, "dentists")
+    assert report["collection_resolved"]
+    assert not report["profiles_complete"]
 
 
 def test_runtime_ignores_untraced_doctors_for_profile_projection(tmp_path: Path):
@@ -177,3 +222,38 @@ def test_runtime_ignores_untraced_doctors_for_profile_projection(tmp_path: Path)
 
     report = specialty_runtime_report(workspace, "dentists")
     assert report["first_seen_providers"] == 1
+
+
+def test_listing_404_is_resolved_but_not_fully_saved(tmp_path: Path):
+    workspace = Workspace(tmp_path / "workspace").ensure()
+    _seed_specialty(workspace)
+    with connect(workspace) as conn:
+        conn.execute("UPDATE doctor_profiles SET status='saved'")
+        conn.execute(
+            """INSERT INTO pages(url,base_location_url,page_no,source,status,
+               discovered_at,specialty_slug,specialty_name,specialty_url)
+               SELECT url||'/2',base_location_url,2,'pagination','unavailable',
+               discovered_at,specialty_slug,specialty_name,specialty_url FROM pages"""
+        )
+        conn.commit()
+    report = specialty_runtime_report(workspace, "dentists")
+    assert report["listing_resolved"]
+    assert report["listing_unavailable"] == 1
+    assert not report["listing_complete"]
+    assert report["collection_resolved"]
+
+
+def test_retired_pagination_does_not_block_listing_resolution(tmp_path: Path):
+    workspace = Workspace(tmp_path / "workspace").ensure()
+    _seed_specialty(workspace)
+    with connect(workspace) as conn:
+        conn.execute(
+            """INSERT INTO pages(url,base_location_url,page_no,source,status,
+               discovered_at,specialty_slug,specialty_name,specialty_url)
+               SELECT url||'/2',base_location_url,2,'pagination','retired',
+               discovered_at,specialty_slug,specialty_name,specialty_url FROM pages"""
+        )
+        conn.commit()
+    report = specialty_runtime_report(workspace, "dentists")
+    assert report["listing_complete"]
+    assert report["listing_resolved"]

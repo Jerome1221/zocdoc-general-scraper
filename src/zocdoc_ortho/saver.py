@@ -12,6 +12,7 @@ from collections import deque
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .profile_challenges import profile_challenge_reason
 from .urls import (
     is_listing_url,
     is_profile_url,
@@ -29,6 +30,7 @@ DEFAULT_SERVER_URL = f"http://{HOST}:{PORT}"
 MAX_BODY = 80 * 1024 * 1024
 SAVER_MODE = "zocdoc-provider-collector-multirunner-v4"
 MANIFEST_FIELDS = ["event_at", "status", "page_type", "url", "title", "file", "bytes", "error"]
+PROFILE_REDIRECT_FIELDS = ["event_at", "requested_url", "canonical_url", "file", "status"]
 
 DEFAULT_CAPTURE_CONFIG = {
     "listing": {"check_ms": 250, "stable_checks": 2, "max_wait_ms": 8000},
@@ -82,6 +84,24 @@ def enqueue_url(
     payload = json.dumps(payload_data).encode("utf-8")
     request = urllib.request.Request(
         f"{normalize_server_url(server_url)}/enqueue",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def request_tab_close(
+    url: str,
+    timeout: float = 3.0,
+    *,
+    server_url: str | None = None,
+) -> dict:
+    """Cancel a queued open and ask the owning runner to close matching tabs."""
+    payload = json.dumps({"url": normalize_url(url)}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{normalize_server_url(server_url)}/cancel",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -176,6 +196,8 @@ class SaverRuntime:
         self.lock = threading.Lock()
         self.open_queue: deque[str] = deque()
         self.open_set: set[str] = set()
+        self.close_queue: deque[str] = deque()
+        self.close_set: set[str] = set()
         self.last_controller_poll = 0.0
         self.capture_config = json.loads(json.dumps(DEFAULT_CAPTURE_CONFIG))
         self.capture_metrics: dict[str, dict] = {}
@@ -192,6 +214,15 @@ class SaverRuntime:
             if new_file:
                 writer.writeheader()
             writer.writerow({key: row.get(key, "") for key in MANIFEST_FIELDS})
+
+    def append_profile_redirect(self, **row) -> None:
+        path = self.workspace.profile_redirects_csv
+        new_file = not path.exists()
+        with path.open("a", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=PROFILE_REDIRECT_FIELDS)
+            if new_file:
+                writer.writeheader()
+            writer.writerow({key: row.get(key, "") for key in PROFILE_REDIRECT_FIELDS})
 
 
 def controller_html() -> str:
@@ -267,6 +298,7 @@ def make_handler(runtime: SaverRuntime):
                         "specialty_landing_save_dir": str(runtime.workspace.specialty_landing_dir),
                         "manifest": str(runtime.workspace.manifest if runtime.runner_id == "single" else runtime.workspace.root / f"manifest.{_runner_token(runtime.runner_id)}.csv"),
                         "queued_open_requests": len(runtime.open_queue),
+                        "queued_close_requests": len(runtime.close_queue),
                         "controller_active": runtime.controller_active(),
                         "capture_config": runtime.capture_config,
                     },
@@ -295,6 +327,17 @@ def make_handler(runtime: SaverRuntime):
                     if runtime.open_queue:
                         url = runtime.open_queue.popleft()
                         runtime.open_set.discard(url)
+                    else:
+                        url = None
+                self._json(200, {"ok": True, "url": url})
+                return
+
+            if request_path == "/next-close":
+                runtime.last_controller_poll = time.time()
+                with runtime.lock:
+                    if runtime.close_queue:
+                        url = runtime.close_queue.popleft()
+                        runtime.close_set.discard(url)
                     else:
                         url = None
                 self._json(200, {"ok": True, "url": url})
@@ -360,33 +403,79 @@ def make_handler(runtime: SaverRuntime):
                 self._json(200, {"ok": True, "queued": True, "url": url, "queue_size": len(runtime.open_queue)})
                 return
 
+            if self.path == "/cancel":
+                url = normalize_url(str(payload.get("url") or ""))
+                if page_type(url) == "unsupported":
+                    self._json(400, {"ok": False, "error": "unsupported Zocdoc URL"})
+                    return
+                with runtime.lock:
+                    runtime.open_queue = deque(item for item in runtime.open_queue if item != url)
+                    runtime.open_set.discard(url)
+                    if url not in runtime.close_set:
+                        runtime.close_queue.append(url)
+                        runtime.close_set.add(url)
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "cancelled": True,
+                        "url": url,
+                        "close_queue_size": len(runtime.close_queue),
+                    },
+                )
+                return
+
             url = normalize_url(str(payload.get("url") or ""))
+            requested_raw = str(payload.get("requested_url") or "").strip()
+            requested_url = normalize_url(requested_raw) if requested_raw else ""
             title = str(payload.get("title") or "")
-            ptype = page_type(url)
-            if ptype == "unsupported":
+            final_ptype = page_type(url)
+            requested_ptype = page_type(requested_url) if requested_url else final_ptype
+            from .profile_availability import profile_unavailable_reason
+
+            unavailable_reason = (
+                profile_unavailable_reason(str(payload.get("html") or ""), final_url=url)
+                if requested_ptype == "profile" else None
+            )
+            if (final_ptype == "unsupported" and not unavailable_reason) or requested_ptype == "unsupported":
                 self._json(400, {"ok": False, "error": "unsupported Zocdoc URL"})
                 return
+            if requested_url and requested_ptype != final_ptype and not unavailable_reason:
+                self._json(409, {"ok": False, "error": "redirect changed page type"})
+                return
+            storage_url = requested_url or url
+            ptype = requested_ptype
 
             if self.path == "/blocked":
                 text = str(payload.get("text") or "")[:3000]
                 event_at = now_iso()
                 with runtime.lock:
                     runtime.workspace.blocked_flag.write_text(
-                        f"blocked_at={event_at}\nurl={url}\ntitle={title}\n\n{text}\n",
+                        f"blocked_at={event_at}\nrequested_url={storage_url}\n"
+                        f"final_url={url}\ntitle={title}\n\n{text}\n",
                         encoding="utf-8",
                     )
                     runtime.append_manifest(
                         event_at=event_at,
                         status="blocked",
                         page_type=ptype,
-                        url=url,
+                        url=storage_url,
                         title=title,
                         file="",
                         bytes="0",
                         error=text,
                     )
-                print(f"BLOCKED [{ptype}]: {url}")
-                self._json(200, {"ok": True, "blocked": True, "page_type": ptype})
+                print(f"BLOCKED [{ptype}]: {storage_url}")
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "blocked": True,
+                        "page_type": ptype,
+                        "requested_url": storage_url,
+                        "final_url": url,
+                    },
+                )
                 return
 
             if self.path != "/save":
@@ -394,6 +483,8 @@ def make_handler(runtime: SaverRuntime):
                 return
 
             html = str(payload.get("html") or "")
+            if unavailable_reason == "Zocdoc profile returned /404":
+                html += "<!-- unavailable capture --> <p>Not Found. Redirecting to /404</p>"
             if not html:
                 self._json(400, {"ok": False, "error": "empty HTML"})
                 return
@@ -401,31 +492,67 @@ def make_handler(runtime: SaverRuntime):
 
             capture_token = ""
             with runtime.lock:
-                tokens = runtime.updater_capture_tokens.get(url)
-                if tokens:
+                for token_url in dict.fromkeys((storage_url, url)):
+                    tokens = runtime.updater_capture_tokens.get(token_url)
+                    if not tokens:
+                        continue
                     capture_token = tokens.popleft()
                     if not tokens:
-                        runtime.updater_capture_tokens.pop(url, None)
+                        runtime.updater_capture_tokens.pop(token_url, None)
+                    break
 
             if capture_token:
                 folder = runtime.workspace.updater_snapshot_dir
                 filename = f"{capture_token}.html"
             elif ptype == "listing":
                 folder = runtime.workspace.listing_dir
-                filename = safe_slug(url)
+                filename = safe_slug(storage_url)
             elif ptype == "profile":
                 folder = runtime.workspace.profile_dir
-                filename = safe_slug(url)
+                filename = safe_slug(storage_url)
             elif ptype == "specialty_landing":
                 folder = runtime.workspace.specialty_landing_dir
-                base_name = safe_slug(url).removesuffix(".html")
+                base_name = safe_slug(storage_url).removesuffix(".html")
                 timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
                 filename = f"{base_name}--{timestamp}.html"
             else:
                 folder = runtime.workspace.specialty_dir
-                base_name = safe_slug(url).removesuffix(".html")
+                base_name = safe_slug(storage_url).removesuffix(".html")
                 timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
                 filename = f"{base_name}--{timestamp}.html"
+
+            if ptype == "profile":
+                challenge_reason = profile_challenge_reason(html)
+                if challenge_reason:
+                    event_at = now_iso()
+                    message = f"Verification challenge detected: {challenge_reason}"
+                    with runtime.lock:
+                        runtime.workspace.blocked_flag.write_text(
+                            f"blocked_at={event_at}\nrequested_url={storage_url}\n"
+                            f"final_url={url}\ntitle={title}\n\n{message}\n",
+                            encoding="utf-8",
+                        )
+                        runtime.append_manifest(
+                            event_at=event_at,
+                            status="blocked",
+                            page_type=ptype,
+                            url=storage_url,
+                            title=title,
+                            file="",
+                            bytes="0",
+                            error=message,
+                        )
+                    print(f"BLOCKED [{ptype}]: {storage_url} | {challenge_reason}")
+                    self._json(
+                        409,
+                        {
+                            "ok": False,
+                            "blocked": True,
+                            "page_type": ptype,
+                            "error": message,
+                        },
+                    )
+                    return
             path = folder / filename
             encoded = html.encode("utf-8")
             event_at = now_iso()
@@ -444,12 +571,21 @@ def make_handler(runtime: SaverRuntime):
                     event_at=event_at,
                     status="existing" if existed else "saved",
                     page_type=ptype,
-                    url=url,
+                    url=storage_url,
                     title=title,
                     file=filename,
                     bytes=str(path.stat().st_size),
                     error="",
                 )
+                status = "existing" if existed else "saved"
+                if ptype == "profile" and storage_url != url:
+                    runtime.append_profile_redirect(
+                        event_at=event_at,
+                        requested_url=storage_url,
+                        canonical_url=url,
+                        file=filename,
+                        status=status,
+                    )
                 server_total = max(0.0, time.monotonic() - request_started)
                 metrics = {
                     "navigation_seconds": round(float(browser_metrics.get("navigation_to_content_script_ms") or 0) / 1000.0, 4),
@@ -463,6 +599,7 @@ def make_handler(runtime: SaverRuntime):
                     "claim_profile_visible": bool(browser_metrics.get("claim_profile_visible")),
                     "readiness_signature": str(browser_metrics.get("readiness_signature") or ""),
                 }
+                runtime.capture_metrics[storage_url] = metrics
                 runtime.capture_metrics[url] = metrics
 
             status = "existing" if existed else "saved"
@@ -486,6 +623,8 @@ def make_handler(runtime: SaverRuntime):
                     "page_type": ptype,
                     "file": filename,
                     "bytes": path.stat().st_size,
+                    "requested_url": storage_url,
+                    "final_url": url,
                 },
             )
 

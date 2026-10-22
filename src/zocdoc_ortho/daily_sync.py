@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import time
 import uuid
@@ -18,7 +19,8 @@ from typing import Any
 from .db import connect
 from .listing import classify_listing_capture, parse_page
 from .profile import parse_profile_rows
-from .queue import _ingest_listing, mark_profile_saved
+from .profile_availability import archive_unavailable_profile, profile_unavailable_reason
+from .queue import _ingest_listing, _queue_tab_close, mark_profile_saved
 from .saver import configure_capture, enqueue_url
 from .trace import find_profile_html, trace_rows_for_doctor
 from .updater import (
@@ -762,6 +764,7 @@ def collect_and_apply_locations(
                 path.unlink(missing_ok=True)
                 continue
             if not path.exists():
+                _queue_tab_close(url, item["controller_url"])
                 _retry_or_fail_listing(
                     state,
                     url,
@@ -774,11 +777,17 @@ def collect_and_apply_locations(
                 parsed = parse_page(html, url)
                 classification, reason = classify_listing_capture(html, parsed)
                 if classification not in {"valid", "valid_empty"}:
+                    if classification == "unavailable":
+                        workspace.rejected_listing_dir.mkdir(parents=True, exist_ok=True)
+                        stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
+                        evidence = workspace.rejected_listing_dir / f"updater404-{stamp}-{path.name}"
+                        path.replace(evidence)
+                        reason = f"{reason}; evidence={evidence.relative_to(workspace.root).as_posix()}"
                     path.unlink(missing_ok=True)
                     _retry_or_fail_listing(
                         state,
                         url,
-                        capture_retries=capture_retries,
+                        capture_retries=0 if classification == "unavailable" else capture_retries,
                         reason=reason,
                     )
                     continue
@@ -813,7 +822,7 @@ def collect_and_apply_locations(
                     f"providers={result['providers_seen']} added={result['providers_added']} "
                     f"removed={result['providers_removed']}"
                 )
-            except Exception as exc:  # keep other locations moving after one bad crawl
+            except Exception as exc:  # noqa: BLE001 - isolate independent location failures
                 _mark_location_failed(workspace, run_id, state, str(exc))
                 print(f"FAILED | {state.target.location_url} | {exc}")
             finally:
@@ -861,6 +870,7 @@ def collect_and_apply_locations(
                     "url": url,
                     "path": path,
                     "runner_id": runner_id,
+                    "controller_url": runner["controller_url"],
                     "started": time.monotonic(),
                 }
                 active_by_runner[runner_id] += 1
@@ -1109,6 +1119,7 @@ def prepare_profile_queue(
     run_id: int,
     *,
     refresh_days: int = DEFAULT_PROFILE_REFRESH_DAYS,
+    parse_local_profiles: bool = True,
 ) -> int:
     if refresh_days < 0:
         raise ValueError("profile refresh days cannot be negative")
@@ -1144,6 +1155,11 @@ def prepare_profile_queue(
             ).fetchall()
         for provider in providers:
             doctor_url = normalize_url(provider["doctor_url"])
+            availability = conn.execute(
+                "SELECT status FROM doctor_profiles WHERE doctor_url=?", (doctor_url,)
+            ).fetchone()
+            if availability is not None and availability["status"] == "unavailable":
+                continue
             path = find_profile_html(workspace, doctor_url)
             canonical = conn.execute(
                 """
@@ -1152,7 +1168,7 @@ def prepare_profile_queue(
                 """,
                 (doctor_url,),
             ).fetchone()
-            if path is not None and (canonical is None or not canonical["profile_sha256"]):
+            if parse_local_profiles and path is not None and (canonical is None or not canonical["profile_sha256"]):
                 html = path.read_text(encoding="utf-8", errors="replace")
                 valid, _ = _store_profile_html(
                     conn,
@@ -1191,7 +1207,11 @@ def prepare_profile_queue(
                 ) VALUES (?,?,?,?, 'pending', ?)
                 ON CONFLICT(run_id,doctor_url) DO UPDATE SET
                     doctor_name=excluded.doctor_name,reason=excluded.reason,
-                    status=CASE WHEN daily_profile_queue.status='saved' THEN 'saved' ELSE 'pending' END,
+                    status=CASE
+                        WHEN daily_profile_queue.status IN ('saved','unavailable')
+                            THEN daily_profile_queue.status
+                        ELSE 'pending'
+                    END,
                     error=''
                 """,
                 (run_id, doctor_url, provider["doctor_name"] or "", reason, now_iso()),
@@ -1217,11 +1237,38 @@ def _finish_profile_attempt(
     run_id: int,
     doctor_url: str,
     token_path: Path,
-) -> tuple[bool, str]:
+) -> tuple[str, str]:
     try:
         html = token_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        return False, str(exc)
+        return "failed", str(exc)
+    unavailable_reason = profile_unavailable_reason(html)
+    if unavailable_reason:
+        try:
+            archive_unavailable_profile(workspace, token_path, doctor_url)
+        except OSError as exc:
+            return "failed", f"could not archive unavailable profile: {exc}"
+        stamp = now_iso()
+        with connect(workspace) as conn:
+            conn.execute(
+                """
+                UPDATE daily_profile_queue
+                SET status='unavailable',completed_at=?,error=?
+                WHERE run_id=? AND doctor_url=?
+                """,
+                (stamp, unavailable_reason, run_id, doctor_url),
+            )
+            conn.execute(
+                """
+                UPDATE doctor_profiles
+                SET status='unavailable',file='',bytes=0,saved_at=NULL,
+                    error=?,last_error=?,last_seen_at=?,claimed_by=NULL,claimed_at=NULL
+                WHERE doctor_url=?
+                """,
+                (unavailable_reason, unavailable_reason, stamp, doctor_url),
+            )
+            conn.commit()
+        return "unavailable", unavailable_reason
     destination = workspace.profile_dir / safe_slug(doctor_url)
     with connect(workspace) as conn:
         valid, reason = _store_profile_html(
@@ -1233,7 +1280,7 @@ def _finish_profile_attempt(
         )
         if not valid:
             conn.rollback()
-            return False, reason
+            return "failed", reason
         temporary = destination.with_suffix(".daily.tmp")
         try:
             temporary.write_bytes(token_path.read_bytes())
@@ -1242,7 +1289,7 @@ def _finish_profile_attempt(
         except OSError as exc:
             temporary.unlink(missing_ok=True)
             conn.rollback()
-            return False, f"could not install profile capture: {exc}"
+            return "failed", f"could not install profile capture: {exc}"
         mark_profile_saved(conn, workspace, doctor_url, destination, write_output=False)
         conn.execute(
             """
@@ -1253,7 +1300,7 @@ def _finish_profile_attempt(
             (now_iso(), run_id, doctor_url),
         )
         conn.commit()
-    return True, ""
+    return "saved", ""
 
 
 def collect_daily_profiles(
@@ -1261,29 +1308,142 @@ def collect_daily_profiles(
     run_id: int,
     *,
     runner_ids: tuple[str, ...] = (),
+    specialties: tuple[str, ...] = (),
+    retry_failed: bool = False,
+    retry_unavailable: bool = False,
+    reset_failed_only: bool = False,
     limit: int | None = None,
     concurrency_per_runner: int = 3,
+    stagger_seconds: float = 0.0,
     timeout_seconds: float = LIVE_TIMEOUT_SECONDS,
     poll_seconds: float = LIVE_POLL_SECONDS,
     capture_retries: int = DEFAULT_CAPTURE_RETRIES,
 ) -> dict[str, int]:
     if limit is not None and limit < 1:
         raise ValueError("profile limit must be at least 1")
+    if retry_unavailable and limit is None:
+        raise ValueError("retry-unavailable requires an explicit profile limit")
+    if retry_unavailable and reset_failed_only:
+        raise ValueError("retry-unavailable cannot be combined with reset-failed-only")
     if capture_retries < 0:
         raise ValueError("capture_retries cannot be negative")
+    if stagger_seconds < 0:
+        raise ValueError("profile stagger cannot be negative")
+    selectors = sorted(
+        {value.strip().lower() for value in specialties if value.strip()}
+    )
     with connect(workspace) as conn:
+        # Global availability wins over stale jobs from older runs and historical details.
+        conn.execute(
+            """
+            UPDATE daily_profile_queue AS q
+            SET status='unavailable',completed_at=COALESCE(completed_at,?),
+                error=(SELECT p.last_error FROM doctor_profiles p WHERE p.doctor_url=q.doctor_url)
+            WHERE run_id=? AND status IN ('pending','retry_pending','opening','failed')
+              AND EXISTS (SELECT 1 FROM doctor_profiles p
+                          WHERE p.doctor_url=q.doctor_url AND p.status='unavailable')
+            """, (now_iso(), run_id),
+        )
+        if retry_unavailable:
+            retry_sql = """
+                SELECT q.doctor_url FROM daily_profile_queue q
+                WHERE q.run_id=? AND q.status='unavailable'
+            """
+            retry_params: list[Any] = [run_id]
+            if selectors:
+                placeholders = ",".join("?" for _ in selectors)
+                retry_sql += f"""
+                    AND EXISTS (SELECT 1 FROM provider_location_memberships m
+                        WHERE m.doctor_url=q.doctor_url AND m.is_active=1
+                        AND (lower(m.specialty_slug) IN ({placeholders})
+                             OR lower(m.specialty) IN ({placeholders})))
+                """
+                retry_params.extend(selectors * 2)
+            retry_sql += " ORDER BY q.doctor_name,q.doctor_url LIMIT ?"
+            retry_params.append(limit)
+            for row in conn.execute(retry_sql, retry_params).fetchall():
+                conn.execute(
+                    """UPDATE daily_profile_queue SET status='pending',reason='retry_unavailable',
+                       attempt_count=0,started_at=NULL,completed_at=NULL,error=''
+                       WHERE run_id=? AND doctor_url=?""", (run_id, row["doctor_url"]),
+                )
+        conn.execute(
+            """
+            UPDATE daily_profile_queue AS q
+            SET status='saved',completed_at=COALESCE(completed_at,?),error=''
+            WHERE run_id=? AND status IN ('pending','retry_pending','opening')
+              AND reason<>'retry_unavailable'
+              AND EXISTS (
+                  SELECT 1 FROM canonical_provider_records c
+                  WHERE c.doctor_url=q.doctor_url
+                    AND COALESCE(c.profile_sha256,'')<>''
+              )
+            """,
+            (now_iso(), run_id),
+        )
+        if retry_failed or reset_failed_only:
+            reset_sql = """
+                UPDATE daily_profile_queue AS q
+                SET status='pending',attempt_count=0,started_at=NULL,
+                    completed_at=NULL,error=''
+                WHERE q.run_id=? AND q.status='failed'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM canonical_provider_records c
+                      WHERE c.doctor_url=q.doctor_url
+                        AND COALESCE(c.profile_sha256,'')<>''
+                  )
+            """
+            reset_params: list[Any] = [run_id]
+            if selectors:
+                placeholders = ",".join("?" for _ in selectors)
+                reset_sql += f"""
+                    AND EXISTS (
+                        SELECT 1 FROM provider_location_memberships m
+                        WHERE m.doctor_url=q.doctor_url AND m.is_active=1
+                          AND (
+                              lower(m.specialty_slug) IN ({placeholders})
+                              OR lower(m.specialty) IN ({placeholders})
+                          )
+                    )
+                """
+                reset_params.extend(selectors)
+                reset_params.extend(selectors)
+            reset_cursor = conn.execute(reset_sql, reset_params)
+            reset_count = max(0, int(reset_cursor.rowcount or 0))
+            if reset_count:
+                print(f"FAILED PROFILE JOBS RESET | {reset_count:,}")
+        if reset_failed_only:
+            conn.commit()
+            return {"selected": 0, "saved": 0, "unavailable": 0, "failed": 0}
         sql = """
-            SELECT * FROM daily_profile_queue
-            WHERE run_id=? AND status IN ('pending','retry_pending')
-            ORDER BY doctor_name,doctor_url
+            SELECT q.* FROM daily_profile_queue q
+            WHERE q.run_id=? AND q.status IN ('pending','retry_pending')
         """
+        if retry_unavailable:
+            sql += " AND q.reason='retry_unavailable'"
         params: list[Any] = [run_id]
+        if selectors:
+            placeholders = ",".join("?" for _ in selectors)
+            sql += f"""
+                AND EXISTS (
+                    SELECT 1 FROM provider_location_memberships m
+                    WHERE m.doctor_url=q.doctor_url AND m.is_active=1
+                      AND (
+                          lower(m.specialty_slug) IN ({placeholders})
+                          OR lower(m.specialty) IN ({placeholders})
+                      )
+                )
+            """
+            params.extend(selectors)
+            params.extend(selectors)
+        sql += " ORDER BY q.doctor_name,q.doctor_url"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
         rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+        conn.commit()
     if not rows:
-        return {"selected": 0, "saved": 0, "failed": 0}
+        return {"selected": 0, "saved": 0, "unavailable": 0, "failed": 0}
 
     runners = _active_live_runners(workspace)
     requested = {value.strip() for value in runner_ids if value.strip()}
@@ -1304,23 +1464,46 @@ def collect_daily_profiles(
     pending = deque(rows)
     active: dict[str, dict[str, Any]] = {}
     active_by_runner = {runner["runner_id"]: 0 for runner in runners}
+    next_launch_at = {runner["runner_id"]: 0.0 for runner in runners}
     saved = 0
+    unavailable = 0
     failed = 0
 
     while pending or active:
         if workspace.blocked_flag.exists():
             message = "restriction detected by Chrome saver"
+            affected_urls = {
+                normalize_url(item["row"]["doctor_url"])
+                for item in active.values()
+            }
+            stamp = now_iso()
             with connect(workspace) as conn:
-                conn.execute(
+                conn.executemany(
                     """
                     UPDATE daily_profile_queue
                     SET status='failed',error=?,completed_at=?
-                    WHERE run_id=? AND status IN ('pending','retry_pending','opening')
+                    WHERE run_id=? AND doctor_url=?
+                      AND status IN ('pending','retry_pending','opening')
                     """,
-                    (message, now_iso(), run_id),
+                    [
+                        (message, stamp, run_id, doctor_url)
+                        for doctor_url in affected_urls
+                    ],
+                )
+                conn.executemany(
+                    """
+                    UPDATE doctor_profiles
+                    SET status=CASE WHEN status='unavailable' THEN status ELSE 'blocked' END,
+                        error=?,last_error=?,last_seen_at=?
+                    WHERE doctor_url=?
+                    """,
+                    [
+                        (message, message, stamp, doctor_url)
+                        for doctor_url in affected_urls
+                    ],
                 )
                 conn.commit()
-            failed += len(pending) + len(active)
+            failed += len(active)
             for item in active.values():
                 item["path"].unlink(missing_ok=True)
             pending.clear()
@@ -1334,17 +1517,24 @@ def collect_daily_profiles(
                 continue
             active.pop(token)
             active_by_runner[item["runner_id"]] -= 1
+            next_launch_at[item["runner_id"]] = time.monotonic() + stagger_seconds
             row = item["row"]
             doctor_url = row["doctor_url"]
-            success = False
+            outcome = "failed"
             reason = f"capture timed out after {timeout_seconds:g}s"
             if path.exists():
-                success, reason = _finish_profile_attempt(
+                outcome, reason = _finish_profile_attempt(
                     workspace, run_id, doctor_url, path
                 )
-            if success:
+            else:
+                _queue_tab_close(doctor_url, item["controller_url"])
+            if outcome == "saved":
                 saved += 1
                 print(f"PROFILE SAVED | {doctor_url}")
+                continue
+            if outcome == "unavailable":
+                unavailable += 1
+                print(f"PROFILE UNAVAILABLE | {doctor_url} | {reason}")
                 continue
             path.unlink(missing_ok=True)
             attempts = int(row.get("attempt_count") or 0) + 1
@@ -1366,7 +1556,8 @@ def collect_daily_profiles(
                 )
                 conn.execute(
                     """
-                    UPDATE doctor_profiles SET status=?,error=?,last_error=?,last_seen_at=?
+                    UPDATE doctor_profiles SET status=CASE WHEN status='unavailable' THEN status ELSE ? END,
+                        error=?,last_error=?,last_seen_at=?
                     WHERE doctor_url=?
                     """,
                     ("timeout" if status == "failed" else "pending", reason, reason, now_iso(), doctor_url),
@@ -1375,6 +1566,8 @@ def collect_daily_profiles(
 
         for runner in runners:
             runner_id = runner["runner_id"]
+            if time.monotonic() < next_launch_at[runner_id]:
+                continue
             while active_by_runner[runner_id] < concurrency_per_runner and pending:
                 row = pending.popleft()
                 doctor_url = normalize_url(row["doctor_url"])
@@ -1387,6 +1580,7 @@ def collect_daily_profiles(
                         capture_token=token,
                     )
                 except (OSError, ValueError) as exc:
+                    next_launch_at[runner_id] = time.monotonic() + stagger_seconds
                     row["attempt_count"] = int(row.get("attempt_count") or 0) + 1
                     if row["attempt_count"] <= capture_retries:
                         pending.append(row)
@@ -1423,13 +1617,22 @@ def collect_daily_profiles(
                     "row": row,
                     "path": path,
                     "runner_id": runner_id,
+                    "controller_url": runner["controller_url"],
                     "started": time.monotonic(),
                 }
                 active_by_runner[runner_id] += 1
-        if active:
+                next_launch_at[runner_id] = time.monotonic() + stagger_seconds
+                if stagger_seconds > 0:
+                    break
+        if active or pending:
             time.sleep(max(0.01, poll_seconds))
 
-    return {"selected": len(rows), "saved": saved, "failed": failed}
+    return {
+        "selected": len(rows),
+        "saved": saved,
+        "unavailable": unavailable,
+        "failed": failed,
+    }
 
 
 def _finalize_run(
@@ -1456,6 +1659,7 @@ def _finalize_run(
             SELECT
                 SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END) completed,
                 SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,
+                SUM(CASE WHEN status NOT IN ('complete','failed') THEN 1 ELSE 0 END) pending,
                 COALESCE(SUM(pages_fetched),0) pages_fetched,
                 COALESCE(SUM(providers_seen),0) providers_seen,
                 COALESCE(SUM(providers_added),0) providers_added,
@@ -1478,11 +1682,13 @@ def _finalize_run(
         profiles_saved = profile_counts.get("saved", 0)
         profiles_failed = profile_counts.get("failed", 0)
         profiles_pending = sum(
-            count for status, count in profile_counts.items() if status not in {"saved", "failed"}
+            count
+            for status, count in profile_counts.items()
+            if status not in {"saved", "unavailable", "failed"}
         )
         if completed == 0 and (failed or error):
             status = "failed"
-        elif error or failed or profiles_failed or (profile_collection_requested and profiles_pending):
+        elif error or failed or location["pending"] or profiles_failed or (profile_collection_requested and profiles_pending):
             status = "partial"
         else:
             status = "complete"
@@ -1518,6 +1724,9 @@ def _finalize_run(
         row = conn.execute("SELECT * FROM daily_sync_runs WHERE id=?", (run_id,)).fetchone()
         result = dict(row)
         result["profiles_pending"] = profiles_pending
+        result["profiles_unavailable"] = profile_counts.get("unavailable", 0)
+        result["all_profiles_saved"] = bool(profile_counts) and profiles_saved == sum(profile_counts.values())
+        result["collection_resolved"] = not location["pending"] and not failed and not error and not profiles_failed and not profiles_pending
         return result
 
 
@@ -1595,7 +1804,7 @@ def run_daily_sync(
                         database_published=True,
                         profile_collection_requested=not skip_profiles,
                     )
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - finalize failed capture jobs before returning
                     result = _finalize_run(
                         workspace,
                         run_id,
@@ -1614,20 +1823,36 @@ def run_daily_sync(
             raise
 
 
-def bootstrap_from_trace(workspace: Workspace) -> dict[str, int]:
+def bootstrap_from_trace(
+    workspace: Workspace, *, specialties: tuple[str, ...] = (), resume_run_id: int | None = None,
+    skip_profiles: bool = False, min_free_gb: float = 3,
+) -> dict[str, int]:
     """Seed canonical memberships from existing trace rows without removing anything."""
+    if min_free_gb < 0:
+        raise ValueError("Minimum free space cannot be negative")
+    if resume_run_id is not None and specialties:
+        raise ValueError("Resume uses the original run scope; do not add specialty filters")
+    selectors = [s.strip().lower() for s in specialties if s.strip()]
+    if specialties and not selectors:
+        raise ValueError("Specialty filters cannot be blank")
+    workspace.ensure()
+    if shutil.disk_usage(workspace.root).free < min_free_gb * 1024**3:
+        raise RuntimeError("Insufficient disk space for bootstrap")
     with daily_sync_lock(workspace):
         with connect(workspace) as conn:
+            marks = ",".join("?" for _ in selectors)
+            clause = f" AND (lower(p.specialty_slug) IN ({marks}) OR lower(p.specialty_name) IN ({marks}))" if selectors else ""
             groups = conn.execute(
-                """
+                f"""
                 SELECT p.specialty_name,p.specialty_slug,p.location,p.base_location_url,
-                       COUNT(DISTINCT t.doctor_url) providers
+                       0 providers
                 FROM pages p
-                JOIN listing_provider_trace t ON t.listing_url=p.url
                 WHERE p.status IN ('saved','valid_empty')
+                  AND EXISTS (SELECT 1 FROM listing_provider_trace t WHERE t.listing_url=p.url)
+                  {clause}
                 GROUP BY p.specialty_slug,p.base_location_url
                 ORDER BY p.specialty_slug,p.base_location_url
-                """
+                """, selectors * 2,
             ).fetchall()
             targets = [
                 UpdateTarget(
@@ -1639,111 +1864,165 @@ def bootstrap_from_trace(workspace: Workspace) -> dict[str, int]:
                 )
                 for row in groups
             ]
-        run_id = _start_run(workspace, targets, scope="bootstrap")
-        memberships = 0
-        providers: set[str] = set()
-        with connect(workspace) as conn:
-            stamp = now_iso()
-            for target in targets:
-                base = base_location_url(target.location_url)
-                rows = conn.execute(
-                    """
-                    SELECT t.*,p.page_no FROM listing_provider_trace t
-                    JOIN pages p INDEXED BY idx_pages_base_location_url
-                      ON p.url=t.listing_url
-                    WHERE p.base_location_url=?
-                    ORDER BY t.doctor_url,p.page_no,t.card_index
-                    """,
-                    (base,),
-                ).fetchall()
-                grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-                for row in rows:
-                    grouped[normalize_url(row["doctor_url"])].append(dict(row))
-                for doctor_url, traces in grouped.items():
-                    doctor_name = next(
-                        (str(value.get("doctor_name") or "") for value in traces if value.get("doctor_name")),
-                        "",
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO provider_location_memberships(
-                            specialty,specialty_slug,location,location_url,doctor_url,
-                            doctor_name,is_active,first_seen_at,last_seen_at,missing_streak,
-                            last_seen_run_id,listing_data_json
-                        ) VALUES (?,?,?,?,?,?,1,?,?,0,?,?)
-                        ON CONFLICT(specialty_slug,location_url,doctor_url) DO UPDATE SET
-                            is_active=1,last_seen_at=excluded.last_seen_at,inactive_at=NULL,
-                            missing_streak=0,last_seen_run_id=excluded.last_seen_run_id,
-                            listing_data_json=excluded.listing_data_json
-                        """,
-                        (
-                            target.specialty,
-                            target.specialty_slug,
-                            target.location,
-                            base,
-                            doctor_url,
-                            doctor_name,
-                            stamp,
-                            stamp,
-                            run_id,
-                            json.dumps(traces, ensure_ascii=False, default=str),
-                        ),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO canonical_provider_records(
-                            doctor_url,doctor_name,is_active,first_seen_at,last_seen_at,last_seen_run_id
-                        ) VALUES (?,?,1,?,?,?)
-                        ON CONFLICT(doctor_url) DO UPDATE SET
-                            is_active=1,last_seen_at=excluded.last_seen_at,inactive_at=NULL,
-                            last_seen_run_id=excluded.last_seen_run_id
-                        """,
-                        (doctor_url, doctor_name, stamp, stamp, run_id),
-                    )
-                    providers.add(doctor_url)
-                    memberships += 1
-                digest = hashlib.sha256("\n".join(sorted(grouped)).encode("utf-8")).hexdigest()
+            completed_keys = set()
+            if resume_run_id is not None:
+                run = conn.execute("SELECT scope,status FROM daily_sync_runs WHERE id=?", (resume_run_id,)).fetchone()
+                if run is None or run["scope"] != "bootstrap" or run["status"] == "complete":
+                    raise ValueError("Resume requires an unfinished bootstrap run")
+                if conn.execute("SELECT 1 FROM daily_sync_runs WHERE id>?", (resume_run_id,)).fetchone():
+                    raise ValueError("A newer updater run supersedes this run; reconcile it instead")
+                saved_targets = conn.execute("SELECT * FROM daily_sync_locations WHERE run_id=? ORDER BY specialty_slug,location_url", (resume_run_id,)).fetchall()
+                targets = [UpdateTarget(specialty=r["specialty"], specialty_slug=r["specialty_slug"],
+                            location=r["location"], location_url=r["location_url"], verified_provider_count=None)
+                           for r in saved_targets]
+                completed_keys = {(r["specialty_slug"], r["location_url"]) for r in saved_targets if r["status"] == "complete"}
+        if not targets:
+            raise ValueError("No saved listing targets match this bootstrap")
+        run_id = resume_run_id or _start_run(workspace, targets, scope="bootstrap")
+        print(f"BOOTSTRAP | run={run_id} | locations={len(targets):,} | already committed={len(completed_keys):,}", flush=True)
+        try:
+            return _bootstrap_targets(workspace, run_id, targets, completed_keys,
+                                      skip_profiles=skip_profiles, min_free_gb=min_free_gb,
+                                      migrate_csv=not specialties and resume_run_id is None)
+        except BaseException as exc:
+            try:
+                with connect(workspace) as conn:
+                    conn.execute("UPDATE daily_sync_runs SET status='interrupted',error=? WHERE id=?",
+                                 (f"{type(exc).__name__}: {exc}; resume this run to continue", run_id))
+                    conn.commit()
+            except sqlite3.Error:
+                pass
+            raise
+
+
+def _bootstrap_targets(workspace, run_id, targets, completed_keys, *, skip_profiles, min_free_gb, migrate_csv):
+    started = time.monotonic()
+    with connect(workspace) as conn:
+        stamp = now_iso()
+        conn.execute("UPDATE daily_sync_runs SET status='running',completed_at=NULL,error='' WHERE id=?", (run_id,))
+        conn.commit()
+        for index, target in enumerate(targets, 1):
+            if (target.specialty_slug, normalize_url(target.location_url)) in completed_keys:
+                continue
+            if shutil.disk_usage(workspace.root).free < min_free_gb * 1024**3:
+                raise RuntimeError("Insufficient disk space; committed locations are resumable")
+            base = base_location_url(target.location_url)
+            rows = conn.execute(
+                """
+                SELECT t.*,p.page_no FROM listing_provider_trace t
+                JOIN pages p INDEXED BY idx_pages_base_location_url
+                  ON p.url=t.listing_url
+                WHERE p.base_location_url=? AND p.specialty_slug=?
+                  AND p.status IN ('saved','valid_empty')
+                ORDER BY t.doctor_url,p.page_no,t.card_index
+                """,
+                (base, target.specialty_slug),
+            ).fetchall()
+            grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for row in rows:
+                grouped[normalize_url(row["doctor_url"])].append(dict(row))
+            for doctor_url, traces in grouped.items():
+                doctor_name = next(
+                    (str(value.get("doctor_name") or "") for value in traces if value.get("doctor_name")),
+                    "",
+                )
                 conn.execute(
                     """
-                    UPDATE daily_sync_locations
-                    SET status='complete',providers_seen=?,provider_set_hash=?,
-                        pages_fetched=(SELECT COUNT(*) FROM pages WHERE base_location_url=?
-                            AND status IN ('saved','valid_empty')),
-                        expected_pages=(SELECT COALESCE(MAX(page_no),1) FROM pages
-                            WHERE base_location_url=? AND status IN ('saved','valid_empty')),
-                        started_at=?,completed_at=?
-                    WHERE run_id=? AND specialty_slug=? AND location_url=?
+                    INSERT INTO provider_location_memberships(
+                        specialty,specialty_slug,location,location_url,doctor_url,
+                        doctor_name,is_active,first_seen_at,last_seen_at,missing_streak,
+                        last_seen_run_id,listing_data_json
+                    ) VALUES (?,?,?,?,?,?,1,?,?,0,?,?)
+                    ON CONFLICT(specialty_slug,location_url,doctor_url) DO UPDATE SET
+                        is_active=1,last_seen_at=excluded.last_seen_at,inactive_at=NULL,
+                        missing_streak=0,last_seen_run_id=excluded.last_seen_run_id,
+                        listing_data_json=excluded.listing_data_json
                     """,
-                    (len(grouped), digest, base, base, stamp, stamp, run_id, target.specialty_slug, base),
+                    (
+                        target.specialty,
+                        target.specialty_slug,
+                        target.location,
+                        base,
+                        doctor_url,
+                        doctor_name,
+                        stamp,
+                        stamp,
+                        run_id,
+                        json.dumps(traces, ensure_ascii=False, default=str),
+                    ),
                 )
+                conn.execute(
+                    """
+                    INSERT INTO canonical_provider_records(
+                        doctor_url,doctor_name,is_active,first_seen_at,last_seen_at,last_seen_run_id
+                    ) VALUES (?,?,1,?,?,?)
+                    ON CONFLICT(doctor_url) DO UPDATE SET
+                        is_active=1,last_seen_at=excluded.last_seen_at,inactive_at=NULL,
+                        last_seen_run_id=excluded.last_seen_run_id
+                    """,
+                    (doctor_url, doctor_name, stamp, stamp, run_id),
+                )
+            digest = hashlib.sha256("\n".join(sorted(grouped)).encode("utf-8")).hexdigest()
+            conn.execute(
+                """
+                UPDATE daily_sync_locations
+                SET status='complete',providers_seen=?,provider_set_hash=?,
+                    pages_fetched=(SELECT COUNT(*) FROM pages WHERE base_location_url=?
+                        AND status IN ('saved','valid_empty')),
+                    expected_pages=(SELECT COALESCE(MAX(page_no),1) FROM pages
+                        WHERE base_location_url=? AND status IN ('saved','valid_empty')),
+                    started_at=?,completed_at=?
+                WHERE run_id=? AND specialty_slug=? AND location_url=?
+                """,
+                (len(grouped), digest, base, base, stamp, stamp, run_id, target.specialty_slug, base),
+            )
+            conn.execute("""UPDATE daily_sync_runs SET
+                locations_completed=(SELECT COUNT(*) FROM daily_sync_locations WHERE run_id=? AND status='complete'),
+                providers_seen=(SELECT COALESCE(SUM(providers_seen),0) FROM daily_sync_locations WHERE run_id=?)
+                WHERE id=?""", (run_id, run_id, run_id))
             conn.commit()
-        profile_source = workspace.output_dir / "unique_doctors.csv"
-        profile_migration = (
-            migrate_profiles_from_export(workspace, input_path=profile_source)
-            if profile_source.exists()
-            else {
-                "source": str(profile_source),
-                "scanned": 0,
-                "imported": 0,
-                "already_present": 0,
-                "invalid": 0,
-                "unmatched": 0,
-            }
-        )
-        prepare_profile_queue(workspace, run_id, refresh_days=DEFAULT_PROFILE_REFRESH_DAYS)
-        result = _finalize_run(
-            workspace,
-            run_id,
-            profile_collection_requested=False,
-        )
-        return {
-            "run_id": run_id,
-            "locations": int(result["locations_completed"]),
-            "memberships": memberships,
-            "providers": len(providers),
-            "profiles_imported": int(profile_migration["imported"]),
-            "profiles_queued": int(result["profiles_queued"]),
+            if index == 1 or index % 10 == 0 or index == len(targets):
+                print(f"BOOTSTRAP | run={run_id} | committed locations={index:,}/{len(targets):,} "
+                      f"elapsed={(time.monotonic()-started)/60:.1f}m", flush=True)
+    profile_source = workspace.output_dir / "unique_doctors.csv"
+    profile_migration = (
+        migrate_profiles_from_export(workspace, input_path=profile_source)
+        if migrate_csv and not skip_profiles and profile_source.exists()
+        else {
+            "source": str(profile_source),
+            "scanned": 0,
+            "imported": 0,
+            "already_present": 0,
+            "invalid": 0,
+            "unmatched": 0,
         }
+    )
+    if not skip_profiles:
+        from .local_profiles import _import_local_profiles
+        print(f"BOOTSTRAP | run={run_id} | importing retained local profiles", flush=True)
+        with connect(workspace) as conn:
+            local = _import_local_profiles(conn, workspace, run_id=run_id, min_free_gb=min_free_gb)
+            profile_migration["imported"] += local["imported"]
+        print(f"BOOTSTRAP | run={run_id} | preparing profile queue (no browsing)", flush=True)
+        prepare_profile_queue(workspace, run_id, refresh_days=DEFAULT_PROFILE_REFRESH_DAYS, parse_local_profiles=False)
+    result = _finalize_run(
+        workspace,
+        run_id,
+        profile_collection_requested=False,
+    )
+    return {
+        "run_id": run_id,
+        "locations": int(result["locations_completed"]),
+        "memberships": int(result["providers_seen"]),
+        "providers": _bootstrap_provider_count(workspace, run_id),
+        "profiles_imported": int(profile_migration["imported"]),
+        "profiles_queued": int(result["profiles_queued"]),
+    }
+
+
+def _bootstrap_provider_count(workspace: Workspace, run_id: int) -> int:
+    with connect(workspace) as conn:
+        return int(conn.execute("SELECT COUNT(DISTINCT doctor_url) FROM provider_location_memberships WHERE last_seen_run_id=?", (run_id,)).fetchone()[0])
 
 
 def resume_daily_profiles(
@@ -1751,8 +2030,13 @@ def resume_daily_profiles(
     *,
     run_id: int | None = None,
     runner_ids: tuple[str, ...] = (),
+    specialties: tuple[str, ...] = (),
+    retry_failed: bool = False,
+    retry_unavailable: bool = False,
+    reset_failed_only: bool = False,
     limit: int | None = None,
     concurrency_per_runner: int = 3,
+    stagger_seconds: float = 0.0,
     timeout_seconds: float = LIVE_TIMEOUT_SECONDS,
     poll_seconds: float = LIVE_POLL_SECONDS,
     capture_retries: int = DEFAULT_CAPTURE_RETRIES,
@@ -1765,10 +2049,12 @@ def resume_daily_profiles(
                     SELECT r.id FROM daily_sync_runs r
                     WHERE EXISTS (
                         SELECT 1 FROM daily_profile_queue q
-                        WHERE q.run_id=r.id AND q.status IN ('pending','retry_pending','opening')
+                        WHERE q.run_id=r.id AND (q.status IN ('pending','retry_pending','opening')
+                            OR (? AND q.status='unavailable'))
                     )
                     ORDER BY r.id DESC LIMIT 1
-                    """
+                    """,
+                    (int(retry_unavailable),),
                 ).fetchone()
                 if row is None:
                     raise RuntimeError("No daily run has pending profiles.")
@@ -1782,8 +2068,13 @@ def resume_daily_profiles(
             workspace,
             run_id,
             runner_ids=runner_ids,
+            specialties=specialties,
+            retry_failed=retry_failed,
+            retry_unavailable=retry_unavailable,
+            reset_failed_only=reset_failed_only,
             limit=limit,
             concurrency_per_runner=concurrency_per_runner,
+            stagger_seconds=stagger_seconds,
             timeout_seconds=timeout_seconds,
             poll_seconds=poll_seconds,
             capture_retries=capture_retries,
@@ -1848,7 +2139,7 @@ def run_daily_daemon(
                 f"locations={result['locations_completed']}/{result['locations_selected']} "
                 f"added={result['providers_added']} removed={result['providers_removed']}"
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - keep the scheduler alive after a failed daily run
             print(f"DAILY RUN FAILED | {exc}")
         next_run = started + timedelta(hours=interval_hours)
         sleep_seconds = max(1.0, (next_run - datetime.now(UTC)).total_seconds())

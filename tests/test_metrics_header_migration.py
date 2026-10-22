@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from zocdoc_ortho.performance import PerformanceRecorder, RUN_FIELDS
+from zocdoc_ortho.performance import RUN_FIELDS, PerformanceRecorder
 from zocdoc_ortho.runners import combined_performance_report
 from zocdoc_ortho.workspace import Workspace
 

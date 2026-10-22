@@ -12,18 +12,18 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from .outputs import export_page_outputs
+from .profile_challenges import js_adblock_challenge_reason
 from .redux import extract_redux_state
 from .urls import (
     absolute_zocdoc_url,
     base_location_url,
+    is_profile_url,
     normalize_url,
     page_number,
     profile_path,
-    is_profile_url,
 )
 from .utils import now_iso, tri_bool, walk_dicts
 from .workspace import Workspace
-
 
 ZERO_LINK_MAX_RETRIES = 2
 
@@ -46,12 +46,37 @@ _RESTRICTION_PATTERNS = (
 )
 
 
+def listing_unavailable_reason(html: str) -> str | None:
+    """Recognize explicit Zocdoc 404 responses, not generic empty captures."""
+    soup = BeautifulSoup(str(html or ""), "html.parser")
+    text = " ".join(soup.get_text(" ", strip=True).lower().split())
+    title = " ".join(soup.title.get_text(" ", strip=True).lower().split()) if soup.title else ""
+    if any(marker in text for marker in _RESTRICTION_PATTERNS):
+        return None
+    if re.search(r"not found\.?\s*redirecting to\s*/404(?:\s|$|[.])", text):
+        return "Zocdoc listing returned an explicit /404 redirect"
+    if (
+        re.search(r"\b404\s+error\b", title)
+        and "zocdoc" in title
+        and "well, this is unexpected" in text
+        and "this page may no longer be available" in text
+    ):
+        return "Zocdoc listing returned its explicit 404 error page"
+    return None
+
+
 def classify_listing_capture(html: str, parsed: dict) -> tuple[str, str]:
     """Classify a rendered listing capture before declaring it complete.
 
     Returns (classification, reason), where classification is one of:
-    valid, valid_empty, retry_zero, restriction_like.
+    valid, valid_empty, unavailable, retry_zero, restriction_like.
     """
+    js_reason = js_adblock_challenge_reason(html)
+    if js_reason:
+        return "restriction_like", js_reason
+    unavailable = listing_unavailable_reason(html)
+    if unavailable:
+        return "unavailable", unavailable
     if parsed.get("doctors"):
         return "valid", "provider links found"
 
@@ -286,6 +311,23 @@ def process_saved_html(
     parse_started = time.monotonic()
     parsed = parse_page(html, page_url)
     classification, validation_reason = classify_listing_capture(html, parsed)
+    if classification == "unavailable":
+        # Retain historical provider hashes and trace; a 404 is not an empty snapshot.
+        conn.execute(
+            """UPDATE pages SET status='unavailable',title=?,
+               validation_status='unavailable_404',validation_reason=?,error=?
+               WHERE url=?""",
+            (title, validation_reason, validation_reason, page_url),
+        )
+        conn.commit()
+        parsed.update(
+            doctors=[], pagination_urls=[], queue_status="unavailable",
+            validation_status="unavailable_404", validation_reason=validation_reason,
+            zero_link_retry_count=int(row["zero_link_retry_count"] or 0),
+        )
+        if write_outputs:
+            export_page_outputs(conn, workspace)
+        return parsed
     current_retry_count = int(row["zero_link_retry_count"] or 0)
     retry_count = current_retry_count
     if classification == "valid":
@@ -481,13 +523,14 @@ def _container_location(container: dict) -> dict:
     return {}
 
 
-def find_structured_provider(redux_state: dict | None, doctor_url: str, postal_code: str = ""):
+def _build_structured_provider_index(redux_state: dict | None) -> dict[str, list[tuple[int, dict, dict, str]]]:
+    """Index Redux provider candidates once instead of walking it for every card."""
+    index: dict[str, list[tuple[int, dict, dict, str]]] = {}
     if not redux_state:
-        return {}, {}
-    target = profile_path(doctor_url)
-    candidates = []
+        return index
     for obj in walk_dicts(redux_state):
-        if profile_path(_provider_profile_url(obj)) == target:
+        direct_path = profile_path(_provider_profile_url(obj))
+        if direct_path:
             richness = sum(
                 key in obj
                 for key in (
@@ -501,11 +544,13 @@ def find_structured_provider(redux_state: dict | None, doctor_url: str, postal_c
                     "offersTelemedicine",
                 )
             )
-            candidates.append((10 + richness, obj, {}))
+            index.setdefault(direct_path, []).append((10 + richness, obj, {}, ""))
 
         provider = obj.get("provider") if isinstance(obj, dict) else None
-        if isinstance(provider, dict) and profile_path(_provider_profile_url(provider)) == target:
-            score = 20
+        if isinstance(provider, dict):
+            provider_path = profile_path(_provider_profile_url(provider))
+            if not provider_path:
+                continue
             location = _container_location(obj)
             loc_zip = str(
                 location.get("zipCode")
@@ -513,17 +558,39 @@ def find_structured_provider(redux_state: dict | None, doctor_url: str, postal_c
                 or location.get("zip")
                 or ""
             )
-            if postal_code and loc_zip == str(postal_code):
-                score += 10
+            score = 20
             if isinstance(obj.get("id"), str) and "|" in obj.get("id", ""):
                 score += 2
-            candidates.append((score, provider, obj))
+            index.setdefault(provider_path, []).append((score, provider, obj, loc_zip))
+    return index
+
+
+def find_structured_provider(
+    redux_state: dict | None,
+    doctor_url: str,
+    postal_code: str = "",
+    *,
+    provider_index: dict[str, list[tuple[int, dict, dict, str]]] | None = None,
+):
+    if not redux_state:
+        return {}, {}
+    target = profile_path(doctor_url)
+    index = provider_index if provider_index is not None else _build_structured_provider_index(redux_state)
+    candidates = index.get(target, [])
 
     if not candidates:
         return {}, {}
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    _, provider, container = candidates[0]
-    return provider, container
+    wanted_postal = str(postal_code) if postal_code else ""
+    best_score = -1
+    best_provider: dict = {}
+    best_container: dict = {}
+    for base_score, provider, container, loc_zip in candidates:
+        score = base_score + (10 if wanted_postal and loc_zip == wanted_postal else 0)
+        if score > best_score:
+            best_score = score
+            best_provider = provider
+            best_container = container
+    return best_provider, best_container
 
 
 def _fallback_occurrence_from_anchor(
@@ -575,6 +642,7 @@ def _fallback_occurrence_from_anchor(
 def extract_listing_occurrences(page_url: str, html: str, page_meta: dict, source_file: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     redux_state = extract_redux_state(html)
+    provider_index = _build_structured_provider_index(redux_state)
     cards = soup.select('article[data-test="search-result-item"]')
     if not cards:
         cards = soup.select('[data-test="search-result-card"] article')
@@ -615,7 +683,12 @@ def extract_listing_occurrences(page_url: str, html: str, page_meta: dict, sourc
         video_marker = card.select_one('[data-test="video-visits-text"]') is not None
         accepts_marker = card.select_one('[data-test="accept-new-patient"]') is not None
 
-        provider, provider_location = find_structured_provider(redux_state, doctor_url, postal)
+        provider, provider_location = find_structured_provider(
+            redux_state,
+            doctor_url,
+            postal,
+            provider_index=provider_index,
+        )
         provider_location_key = ""
         raw_id = provider_location.get("id") if isinstance(provider_location, dict) else None
         if isinstance(raw_id, str) and "|" in raw_id:
@@ -669,7 +742,11 @@ def extract_listing_occurrences(page_url: str, html: str, page_meta: dict, sourc
         doctor_url = normalize_url(doctor.get("doctor_url", ""))
         if not doctor_url or not is_profile_url(doctor_url) or doctor_url in seen_urls:
             continue
-        provider, provider_location = find_structured_provider(redux_state, doctor_url)
+        provider, provider_location = find_structured_provider(
+            redux_state,
+            doctor_url,
+            provider_index=provider_index,
+        )
         raw_id = provider_location.get("id") if isinstance(provider_location, dict) else None
         rows.append(
             {

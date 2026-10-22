@@ -96,3 +96,31 @@ def test_nonbookable_profile_falls_back_to_isbookable():
     rows, diag = parse_profile_rows(url, html, [])
     assert rows[0]["can_have_appointments"] is False
     assert diag["can_have_appointments_source"] == "profile.isBookable"
+
+
+def test_profile_parser_prefers_page_canonical_url_after_redirect():
+    requested_url = "https://www.zocdoc.com/doctor/mark-sonnenschine-do"
+    canonical_url = "https://www.zocdoc.com/doctor/mark-sonnenschine-do-860475"
+    provider = {
+        "id": "pr_redirected",
+        "profileUrl": canonical_url,
+        "approvedFullName": "Mark Sonnenschine, DO",
+        "approvedLocations": [
+            {"id": "lo_1", "city": "Example", "state": "NY", "zipCode": "10001"}
+        ],
+    }
+    state = {"profile": {"data": {"provider": provider}}}
+    html = (
+        '<html><head><link rel="canonical" href="'
+        + canonical_url
+        + '">'
+        + _redux_script(state)
+        + "</head><body></body></html>"
+    )
+
+    rows, diag = parse_profile_rows(requested_url, html, [])
+
+    assert rows[0]["profile_url"] == canonical_url
+    assert rows[0]["provider_id"] == "pr_redirected"
+    assert diag["requested_profile_url"] == requested_url
+    assert diag["canonical_profile_url"] == canonical_url

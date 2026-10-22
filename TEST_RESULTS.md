@@ -1,5 +1,17 @@
 # Dev9.6 daily updater test results
 
+## dailyupdater964 validation (2026-10-22)
+
+- Full Python suite: 125 tests passed, including scoped bootstrap, committed-location resume, interrupted batch rollback, dry-run reconciliation, offline imports and delivery readiness gates.
+- Content-script challenge/review regression suite: 34 scenarios passed.
+- Ruff checks and Git whitespace checks passed.
+- Built the updated wheel with setuptools. Verified its archive and command/module/resource contents from a separate extracted wheel location.
+- Read-only export tests confirm the orthopedic CSV/JSON schemas, matching records, unknown/null preservation, leading-zero ZIP handling and incomplete-data gates.
+- Live SQLite records, browser sessions and scheduled tasks were not changed during this package update. No live scrape, full bootstrap, Git commit or Git push was performed.
+- Live end-to-end scheduled browser collection was not retested. The scheduling guide documents the logged-in Chrome/controller requirement and non-overlapping runs.
+
+The older results below describe earlier releases and should not be read as the current test count.
+
 Test environment: Windows, Anaconda base Python, isolated editable install.
 
 ## Passed

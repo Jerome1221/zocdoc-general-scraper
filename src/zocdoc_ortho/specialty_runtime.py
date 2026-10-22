@@ -196,11 +196,35 @@ def specialty_runtime_report(workspace: Workspace, selector: str) -> dict:
                 *params,
             ],
         ).fetchall()
+        all_profile_rows = conn.execute(
+            f"""
+            SELECT COALESCE(dp.status,'missing') status,
+                   COUNT(DISTINCT t.doctor_url) n
+            FROM listing_provider_trace t
+            LEFT JOIN doctor_profiles dp ON dp.doctor_url=t.doctor_url
+            WHERE {_trace_specialty_clause('t')}
+            GROUP BY COALESCE(dp.status,'missing')
+            """,
+            params,
+        ).fetchall()
 
     page_counts: dict[str, dict[str, int]] = {"seed": {}, "pagination": {}}
     for row in page_rows:
         page_counts.setdefault(row["source"], {})[row["status"]] = int(row["n"])
     profile_counts = {row["status"]: int(row["n"]) for row in profile_rows}
+    all_profile_counts = {row["status"]: int(row["n"]) for row in all_profile_rows}
+    listing_resolved = bool(targets) and not any(
+        count
+        for counts in page_counts.values()
+        for status, count in counts.items()
+        if status not in {"saved", "valid_empty", "unavailable", "retired"}
+    )
+    listing_unavailable = sum(counts.get("unavailable", 0) for counts in page_counts.values())
+    listing_complete = listing_resolved and not listing_unavailable
+    profiles_complete = bool(providers) and all_profile_counts.get("saved", 0) == int(providers)
+    collection_resolved = listing_resolved and bool(providers) and (
+        all_profile_counts.get("saved", 0) + all_profile_counts.get("unavailable", 0) == int(providers)
+    )
 
     rows = _read_runtime_rows(workspace.output_dir / "specialty_runtime.csv", specialty)
     step_rows: dict[str, list[dict]] = {}
@@ -241,7 +265,14 @@ def specialty_runtime_report(workspace: Workspace, selector: str) -> dict:
         "page_counts": page_counts,
         "providers": int(providers),
         "first_seen_providers": int(first_seen_providers),
+        "previously_known_providers": max(0, int(providers) - int(first_seen_providers)),
         "profile_counts": profile_counts,
+        "all_profile_counts": all_profile_counts,
+        "listing_resolved": listing_resolved,
+        "listing_unavailable": listing_unavailable,
+        "listing_complete": listing_complete,
+        "profiles_complete": profiles_complete,
+        "collection_resolved": collection_resolved,
         "steps": steps,
         "projected_total_seconds": round(sum(projected), 3) if projected else None,
         "runtime_csv": str(workspace.output_dir / "specialty_runtime.csv"),

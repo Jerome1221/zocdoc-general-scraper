@@ -153,7 +153,7 @@ def export_final(
         if not values:
             return 0.0
         ordered = sorted(values)
-        index = max(0, min(len(ordered) - 1, int(round((len(ordered) - 1) * 0.95))))
+        index = max(0, min(len(ordered) - 1, round((len(ordered) - 1) * 0.95)))
         return round(ordered[index], 4)
 
     result: dict[str, Path | int | float] = {

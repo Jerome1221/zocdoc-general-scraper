@@ -41,6 +41,14 @@ class Workspace:
         return self.captured / "listing_retries"
 
     @property
+    def rejected_profile_dir(self) -> Path:
+        return self.captured / "profile_challenges"
+
+    @property
+    def unavailable_profile_dir(self) -> Path:
+        return self.captured / "profile_unavailable"
+
+    @property
     def updater_snapshot_dir(self) -> Path:
         return self.captured / "updater_snapshots"
 
@@ -61,6 +69,10 @@ class Workspace:
         return self.root / "manifest.csv"
 
     @property
+    def profile_redirects_csv(self) -> Path:
+        return self.output_dir / "profile_url_redirects.csv"
+
+    @property
     def blocked_flag(self) -> Path:
         return self.root / "BLOCKED.flag"
 
@@ -69,6 +81,8 @@ class Workspace:
         self.listing_dir.mkdir(parents=True, exist_ok=True)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.rejected_listing_dir.mkdir(parents=True, exist_ok=True)
+        self.rejected_profile_dir.mkdir(parents=True, exist_ok=True)
+        self.unavailable_profile_dir.mkdir(parents=True, exist_ok=True)
         self.updater_snapshot_dir.mkdir(parents=True, exist_ok=True)
         self.specialty_dir.mkdir(parents=True, exist_ok=True)
         self.specialty_landing_dir.mkdir(parents=True, exist_ok=True)

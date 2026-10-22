@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.0.dev9+dailyupdater964
+
+- Add specialty-scoped bootstrap, per-location commits, resume checkpoints, progress output and disk-space guards.
+- Integrate offline profile imports with bounded tests, batched commits, dry runs and interruption recovery. Preserve unavailable statuses and existing canonical details.
+- Add explicit interrupted-run reconciliation; pending locations cannot be reported as resolved.
+- Package the orthopedic-format specialty CSV/JSON exporter as `export-delivery`, including readiness gates, deduplication, exceptions and checksums.
+- Cache profile monitor membership and flush worker logs without rebuilding schema on each heartbeat.
+- Include prior challenge, redirect, unavailable-listing and unavailable-profile fixes, plus regression tests and an updated command guide.
+- Exclude local delivery ZIPs, backups and Windows shortcuts from Git.
+
+## 0.2.0.dev9+dailyupdater963
+
+- Preserve the originally requested profile URL across browser redirects so the queue finds the saved HTML immediately.
+- Record requested-to-canonical profile URL redirects in `output/profile_url_redirects.csv`.
+- Parse and export the canonical profile URL embedded in saved profile HTML.
+- Add `repair-profile-redirects` to reconcile historical timeout rows with canonical captures already on disk, without opening a browser.
+- Disable GPU shader caching and Skia Graphite in managed runner Chrome sessions to avoid fatal Windows path-length failures in nested GPU cache directories.
+- Automatically place managed Chrome profiles under a short, workspace-specific `%USERPROFILE%\.zocdoc-collector` path when the workspace path would exceed Windows cache-path limits.
+- Fall back to timestamped runner logs when Windows still has a previous log file handle open during restart.
+
+## 0.2.0.dev9+dailyupdater962
+
+- Detect DataDome `captcha-delivery.com` profile challenges in both the Chrome extension and saver.
+- Reject challenge HTML before it can be marked as a saved provider profile.
+- Add `repair-profile-challenges` to quarantine historical challenge captures and safely reset their queue rows.
+- Print specialty-specific listing, provider, profile, overlap, and completion status after filtered runs.
+
 ## 0.2.0.dev9.6.1-profile-migration
 
 - Added automatic migration of validated `unique_doctors.csv` records into the canonical provider database during bootstrap.

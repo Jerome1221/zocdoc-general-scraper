@@ -92,6 +92,7 @@ def export_page_outputs(conn: sqlite3.Connection, workspace: Workspace) -> None:
         "advertised_total",
         "pages_saved",
         "pages_valid_empty",
+        "pages_unavailable",
         "pages_pending",
         "pages_retry_pending",
         "pages_review",
@@ -101,21 +102,31 @@ def export_page_outputs(conn: sqlite3.Connection, workspace: Workspace) -> None:
     ]
     summaries = conn.execute(
         """
-        SELECT p.specialty_name,p.specialty_slug,p.specialty_url,
-               p.state_group, p.location, p.base_location_url,
-               MAX(p.advertised_total) AS advertised_total,
-               SUM(CASE WHEN p.status='saved' THEN 1 ELSE 0 END) AS pages_saved,
-               SUM(CASE WHEN p.status='valid_empty' THEN 1 ELSE 0 END) AS pages_valid_empty,
-               SUM(CASE WHEN p.status='pending' THEN 1 ELSE 0 END) AS pages_pending,
-               SUM(CASE WHEN p.status='retry_pending' THEN 1 ELSE 0 END) AS pages_retry_pending,
-               SUM(CASE WHEN p.status='review' THEN 1 ELSE 0 END) AS pages_review,
-               SUM(CASE WHEN p.status='blocked' THEN 1 ELSE 0 END) AS pages_blocked,
-               SUM(CASE WHEN p.status='timeout' THEN 1 ELSE 0 END) AS pages_timeout,
-               COUNT(DISTINCT ds.doctor_url) AS unique_profile_links
-        FROM pages p
-        LEFT JOIN doctor_sources ds ON ds.location_url=p.base_location_url
-        GROUP BY p.specialty_url,p.base_location_url
-        ORDER BY p.specialty_name,p.state_group, p.location
+        WITH page_counts AS (
+            SELECT specialty_name,specialty_slug,specialty_url,
+                   state_group,location,base_location_url,
+                   MAX(advertised_total) AS advertised_total,
+                   SUM(CASE WHEN status='saved' THEN 1 ELSE 0 END) AS pages_saved,
+                   SUM(CASE WHEN status='valid_empty' THEN 1 ELSE 0 END) AS pages_valid_empty,
+                   SUM(CASE WHEN status='unavailable' THEN 1 ELSE 0 END) AS pages_unavailable,
+                   SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pages_pending,
+                   SUM(CASE WHEN status='retry_pending' THEN 1 ELSE 0 END) AS pages_retry_pending,
+                   SUM(CASE WHEN status='review' THEN 1 ELSE 0 END) AS pages_review,
+                   SUM(CASE WHEN status='blocked' THEN 1 ELSE 0 END) AS pages_blocked,
+                   SUM(CASE WHEN status='timeout' THEN 1 ELSE 0 END) AS pages_timeout
+            FROM pages
+            GROUP BY specialty_url,base_location_url
+        ), provider_counts AS (
+            SELECT location_url,
+                   COUNT(DISTINCT doctor_url) AS unique_profile_links
+            FROM doctor_sources
+            GROUP BY location_url
+        )
+        SELECT p.*,COALESCE(d.unique_profile_links,0) AS unique_profile_links
+        FROM page_counts p
+        LEFT JOIN provider_counts d
+            ON d.location_url=p.base_location_url
+        ORDER BY p.specialty_name,p.state_group,p.location
         """
     ).fetchall()
     _write_rows(workspace.output_dir / "location_summary.csv", summary_fields, summaries)

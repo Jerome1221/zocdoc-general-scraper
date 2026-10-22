@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import time
+from collections import Counter, deque
 from datetime import UTC, datetime, timedelta
-from collections import Counter
 from pathlib import Path
 
 from .db import connect, trace_table_exists
-from .listing import ZERO_LINK_MAX_RETRIES, process_saved_html
+from .listing import ZERO_LINK_MAX_RETRIES, listing_unavailable_reason, process_saved_html
 from .outputs import export_page_outputs, export_profile_queue
 from .performance import PerformanceRecorder
-from .saver import configure_capture, enqueue_url, get_capture_metrics, get_health
+from .profile_availability import archive_unavailable_profile, profile_unavailable_reason
+from .saver import (
+    configure_capture,
+    enqueue_url,
+    get_capture_metrics,
+    get_health,
+    request_tab_close,
+)
 from .trace import (
     find_listing_html,
     find_profile_html,
@@ -22,6 +30,41 @@ from .utils import now_iso
 from .workspace import Workspace
 
 ATTENTION_STATUSES = ("opening", "timeout", "blocked", "review")
+
+
+def _queue_tab_close(url: str, server_url: str | None) -> None:
+    """Best-effort browser cleanup that must never hide the collector result."""
+    try:
+        request_tab_close(url, timeout=1.0, server_url=server_url)
+        print(f"    TAB CLOSE QUEUED | {url}")
+    except Exception as exc:  # noqa: BLE001 - cleanup must not hide a collection result
+        print(f"    WARNING | could not queue tab close for {url}: {exc}")
+
+
+def _mark_profile_unavailable(
+    conn: sqlite3.Connection,
+    workspace: Workspace,
+    doctor_url: str,
+    path: Path,
+    reason: str,
+    *,
+    write_output: bool,
+) -> Path:
+    archived = archive_unavailable_profile(workspace, path, doctor_url)
+    stamp = now_iso()
+    conn.execute(
+        """
+        UPDATE doctor_profiles
+        SET status='unavailable',file='',bytes=0,saved_at=NULL,
+            error=?,last_error=?,last_seen_at=?,claimed_by=NULL,claimed_at=NULL
+        WHERE doctor_url=?
+        """,
+        (reason, reason, stamp, normalize_url(doctor_url)),
+    )
+    conn.commit()
+    if write_output:
+        export_profile_queue(conn, workspace)
+    return archived
 
 
 def _timing_line(timings: dict, *, include_listing: bool = True) -> str:
@@ -97,7 +140,7 @@ def mark_profile_saved(
 def _quarantine_listing_capture(
     conn: sqlite3.Connection, workspace: Workspace, url: str, path: Path, parsed: dict
 ) -> Path | None:
-    if parsed.get("queue_status") not in {"retry_pending", "review"}:
+    if parsed.get("queue_status") not in {"retry_pending", "review", "unavailable"}:
         return None
     if not path.exists():
         return None
@@ -221,7 +264,7 @@ def _ingest_listing(
                     print(f"    TRACE PARTIAL | keeping raw HTML | {url} | {reason}")
                 else:
                     trace_succeeded = True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - retain raw HTML for later trace repair
                 conn.rollback()
                 parsed["trace_error"] = str(exc)
                 print(f"    TRACE DEFERRED | keeping raw HTML | {url} | {exc}")
@@ -346,7 +389,7 @@ def reconcile_existing_files(workspace: Workspace) -> tuple[int, int]:
     profile_count = 0
     with connect(workspace) as conn:
         for row in conn.execute("SELECT url,status FROM pages").fetchall():
-            if row["status"] in {"saved", "valid_empty"}:
+            if row["status"] in {"saved", "valid_empty", "unavailable"}:
                 continue
             path = find_listing_html(workspace, row["url"])
             if path:
@@ -355,7 +398,7 @@ def reconcile_existing_files(workspace: Workspace) -> tuple[int, int]:
 
         sync_profiles_from_doctors(conn, workspace)
         for row in conn.execute("SELECT doctor_url,status FROM doctor_profiles").fetchall():
-            if row["status"] == "saved":
+            if row["status"] in {"saved", "unavailable"}:
                 continue
             path = find_profile_html(workspace, row["doctor_url"])
             if path:
@@ -424,13 +467,13 @@ def print_status(workspace: Workspace) -> None:
     print(f"Active specialty/location targets: {snap['specialty_targets']:,}")
     print(
         f"Base locations : {sum(seed.values()):,} | saved={seed.get('saved',0):,} "
-        f"empty={seed.get('valid_empty',0):,} pending={seed.get('pending',0):,} "
+        f"empty={seed.get('valid_empty',0):,} unavailable={seed.get('unavailable',0):,} pending={seed.get('pending',0):,} "
         f"retry={seed.get('retry_pending',0):,} review={seed.get('review',0):,} "
         f"timeout={seed.get('timeout',0):,} blocked={seed.get('blocked',0):,}"
     )
     print(
         f"Pagination     : {sum(pagination.values()):,} | saved={pagination.get('saved',0):,} "
-        f"empty={pagination.get('valid_empty',0):,} pending={pagination.get('pending',0):,} "
+        f"empty={pagination.get('valid_empty',0):,} unavailable={pagination.get('unavailable',0):,} pending={pagination.get('pending',0):,} "
         f"retry={pagination.get('retry_pending',0):,} review={pagination.get('review',0):,} "
         f"timeout={pagination.get('timeout',0):,} blocked={pagination.get('blocked',0):,}"
     )
@@ -474,6 +517,74 @@ def _specialty_filter_sql(specialties: tuple[str, ...]) -> tuple[str, list[str]]
         f"OR lower(specialty_url) IN ({placeholders}))"
     )
     return clause, values + values + values
+
+
+def repair_unavailable_listings(
+    workspace: Workspace,
+    *,
+    specialties: tuple[str, ...] = (),
+    dry_run: bool = False,
+) -> dict:
+    """Classify unresolved rows only when retained HTML proves a 404."""
+    clause, params = _specialty_filter_sql(specialties)
+    mode = "ro" if dry_run else "rw"
+    conn = sqlite3.connect(workspace.db.resolve().as_uri() + f"?mode={mode}", uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
+    if dry_run:
+        conn.execute("PRAGMA query_only=ON")
+    try:
+        rows = conn.execute(
+            f"""SELECT * FROM pages
+                WHERE status IN ('pending','retry_pending','review','timeout','blocked')
+                {clause} ORDER BY url""", params,
+        ).fetchall()
+        matches = []
+        for row in rows:
+            path = workspace.root / row["last_rejected_file"] if row["last_rejected_file"] else find_listing_html(workspace, row["url"])
+            if path is None:
+                continue
+            path = path.resolve()
+            if not path.is_relative_to(workspace.root.resolve()) or not path.is_file():
+                continue
+            reason = listing_unavailable_reason(path.read_text(encoding="utf-8", errors="replace"))
+            if reason:
+                matches.append({
+                    "url": row["url"], "previous_status": row["status"],
+                    "previous_evidence": row["last_rejected_file"] or "",
+                    "evidence": path.relative_to(workspace.root.resolve()).as_posix(),
+                    "reason": reason,
+                })
+        backup = None
+        repaired = 0
+        if matches and not dry_run:
+            if shutil.disk_usage(workspace.root).free < workspace.db.stat().st_size + 128 * 1024**2:
+                raise RuntimeError("Insufficient disk space for the required pre-repair database backup")
+            stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
+            backup = workspace.root / "backups" / f"collector_before_listing_unavailable_{stamp}.db"
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            destination = sqlite3.connect(backup)
+            try:
+                conn.backup(destination)
+            finally:
+                destination.close()
+            conn.execute("BEGIN IMMEDIATE")
+            for item in matches:
+                changed = conn.execute(
+                    """UPDATE pages SET status='unavailable',validation_status='unavailable_404',
+                       validation_reason=?,error=?,last_rejected_file=?
+                       WHERE url=? AND status=? AND COALESCE(last_rejected_file,'')=?""",
+                    (item["reason"], item["reason"], item["evidence"], item["url"],
+                     item["previous_status"], item["previous_evidence"]),
+                )
+                repaired += changed.rowcount
+            conn.commit()
+        return {"examined": len(rows), "matches": matches, "repaired": repaired,
+                "dry_run": dry_run, "backup": str(backup) if backup else None}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _pending_pages(
@@ -640,6 +751,8 @@ def collect_listing_batch(
     )
     write_shared_outputs = runner_id == "single"
     active: dict[str, dict] = {}
+    ready: deque[dict] = deque()
+    ready_limit = max(1, concurrency * 2)
     scheduled = 0
     completed = 0
     last_enqueue = 0.0
@@ -663,8 +776,9 @@ def collect_listing_batch(
                         duration_seconds=now - item["started"],
                         specialty_name=item["specialty_name"], location=item["location"],
                     )
-                completed += len(active)
+                completed += len(active) + len(ready)
                 active.clear()
+                ready.clear()
                 print("STOP: restriction detected.")
                 break
 
@@ -673,39 +787,26 @@ def collect_listing_batch(
             for url, item in list(active.items()):
                 path = find_listing_html(workspace, url)
                 if path:
-                    with connect(workspace) as conn:
-                        parsed = _ingest_listing(
-                            conn, workspace, url, path,
-                            write_outputs=write_shared_outputs,
-                            zero_link_max_retries=zero_link_max_retries,
-                            keep_listing_html=keep_listing_html,
-                        )
                     duration = now - item["started"]
                     capture_timings = get_capture_metrics(url, server_url=server_url)
-                    timings = {**capture_timings, **dict(parsed.get("_timings") or {})}
-                    print(
-                        f"    {parsed.get('queue_status','saved').upper()} | {duration:.2f}s | "
-                        f"doctors={len(parsed['doctors'])} pagination={len(parsed['pagination_urls'])}"
-                    )
-                    timing_text = _timing_line(timings, include_listing=True)
-                    if timing_text:
-                        print(f"    TIMING | {timing_text} | total={duration:.3f}s")
-                    recorder.record(
-                        page_type="listing", status="saved", url=url, duration_seconds=duration,
-                        specialty_name=item["specialty_name"], location=item["location"],
-                        doctor_count=len(parsed["doctors"]),
-                        pagination_count=len(parsed["pagination_urls"]),
-                        provider_set_hash=parsed.get("provider_set_hash", ""),
-                        timings=timings,
+                    ready.append(
+                        {
+                            "url": url,
+                            "path": path,
+                            "item": item,
+                            "duration": duration,
+                            "capture_timings": capture_timings,
+                            "existing": False,
+                        }
                     )
                     active.pop(url, None)
-                    completed += 1
                     continue
                 if now - item["started"] > timeout_seconds:
                     with connect(workspace) as conn:
                         mark_page_timeout(conn, url, f"No saved HTML after {timeout_seconds}s")
                         if write_shared_outputs:
                             export_page_outputs(conn, workspace)
+                    _queue_tab_close(url, server_url)
                     print(f"    TIMEOUT | {now - item['started']:.2f}s | {url}")
                     recorder.record(
                         page_type="listing", status="timeout", url=url,
@@ -716,7 +817,12 @@ def collect_listing_batch(
                     completed += 1
 
             # Continuously refill free slots instead of waiting for the slowest page in a batch.
-            while len(active) < concurrency and scheduled < limit and not exhausted:
+            while (
+                len(active) < concurrency
+                and len(ready) < ready_limit
+                and scheduled < limit
+                and not exhausted
+            ):
                 row = _claim_pending_page(workspace, phase, specialties)
                 if row is None:
                     exhausted = True
@@ -724,30 +830,19 @@ def collect_listing_batch(
                 url = normalize_url(row["url"])
                 existing = find_listing_html(workspace, url)
                 if existing:
-                    with connect(workspace) as conn:
-                        parsed = _ingest_listing(
-                            conn, workspace, url, existing,
-                            write_outputs=write_shared_outputs,
-                            zero_link_max_retries=zero_link_max_retries,
-                            keep_listing_html=keep_listing_html,
-                        )
                     scheduled += 1
-                    completed += 1
-                    print(
-                        f"INGEST existing | status={parsed.get('queue_status','saved')} | "
-                        f"doctors={len(parsed['doctors'])} | {url}"
-                    )
-                    existing_timings = dict(parsed.get("_timings") or {})
-                    timing_text = _timing_line(existing_timings, include_listing=True)
-                    if timing_text:
-                        print(f"    TIMING | {timing_text} | existing-html")
-                    recorder.record(
-                        page_type="listing", status="existing", url=url, duration_seconds=0.0,
-                        specialty_name=row["specialty_name"] or row["specialty_slug"] or "",
-                        location=row["location"] or "", doctor_count=len(parsed["doctors"]),
-                        pagination_count=len(parsed["pagination_urls"]),
-                        provider_set_hash=parsed.get("provider_set_hash", ""),
-                        timings=existing_timings,
+                    ready.append(
+                        {
+                            "url": url,
+                            "path": existing,
+                            "item": {
+                                "specialty_name": row["specialty_name"] or row["specialty_slug"] or "",
+                                "location": row["location"] or "",
+                            },
+                            "duration": 0.0,
+                            "capture_timings": {},
+                            "existing": True,
+                        }
                     )
                     continue
 
@@ -774,13 +869,71 @@ def collect_listing_batch(
                 }
                 scheduled += 1
 
-            if not active and (exhausted or scheduled >= limit):
+            # Refill browser slots before parsing completed captures so navigation
+            # overlaps the CPU/SQLite trace stage instead of waiting behind it.
+            if ready:
+                captured = ready.popleft()
+                url = captured["url"]
+                item = captured["item"]
+                with connect(workspace) as conn:
+                    parsed = _ingest_listing(
+                        conn,
+                        workspace,
+                        url,
+                        captured["path"],
+                        write_outputs=write_shared_outputs,
+                        zero_link_max_retries=zero_link_max_retries,
+                        keep_listing_html=keep_listing_html,
+                    )
+                timings = {
+                    **captured["capture_timings"],
+                    **dict(parsed.get("_timings") or {}),
+                }
+                if captured["existing"]:
+                    print(
+                        f"INGEST existing | status={parsed.get('queue_status','saved')} | "
+                        f"doctors={len(parsed['doctors'])} | {url}"
+                    )
+                    timing_text = _timing_line(timings, include_listing=True)
+                    if timing_text:
+                        print(f"    TIMING | {timing_text} | existing-html")
+                    record_status = "existing"
+                else:
+                    print(
+                        f"    {parsed.get('queue_status','saved').upper()} | "
+                        f"{captured['duration']:.2f}s | doctors={len(parsed['doctors'])} "
+                        f"pagination={len(parsed['pagination_urls'])}"
+                    )
+                    timing_text = _timing_line(timings, include_listing=True)
+                    if timing_text:
+                        print(
+                            f"    TIMING | {timing_text} | "
+                            f"total={captured['duration']:.3f}s"
+                        )
+                    record_status = "saved"
+                recorder.record(
+                    page_type="listing",
+                    status=record_status,
+                    url=url,
+                    duration_seconds=captured["duration"],
+                    specialty_name=item["specialty_name"],
+                    location=item["location"],
+                    doctor_count=len(parsed["doctors"]),
+                    pagination_count=len(parsed["pagination_urls"]),
+                    provider_set_hash=parsed.get("provider_set_hash", ""),
+                    timings=timings,
+                )
+                completed += 1
+
+            if not active and not ready and (exhausted or scheduled >= limit):
                 break
-            if active:
+            if active and not ready:
                 time.sleep(poll_seconds)
 
         return completed
     finally:
+        for url in tuple(active):
+            _queue_tab_close(url, server_url)
         summary = recorder.finish()
         if summary:
             print(
@@ -829,13 +982,11 @@ def _claim_pending_profile(
                 placeholders = ",".join("?" for _ in values)
                 specialty_clause = (
                     f" AND EXISTS ("
-                    f"SELECT 1 FROM doctors d JOIN specialties s ON "
-                    f"(lower(s.specialty_name)=lower(d.first_seen_specialty_name) "
-                    f"OR lower(s.specialty_url)=lower(d.first_seen_specialty_url)) "
-                    f"WHERE d.doctor_url=dp.doctor_url AND ("
-                    f"lower(s.specialty_slug) IN ({placeholders}) OR "
-                    f"lower(s.specialty_name) IN ({placeholders}) OR "
-                    f"lower(s.specialty_url) IN ({placeholders})))"
+                    f"SELECT 1 FROM listing_provider_trace t "
+                    f"WHERE t.doctor_url=dp.doctor_url AND ("
+                    f"lower(t.listing_specialty_slug) IN ({placeholders}) OR "
+                    f"lower(t.listing_specialty_name) IN ({placeholders}) OR "
+                    f"lower(t.listing_specialty_url) IN ({placeholders})))"
                 )
                 params = values + values + values
             else:
@@ -965,6 +1116,32 @@ def collect_profile_batch(
             for url, item in list(active.items()):
                 path = find_profile_html(workspace, url)
                 if path:
+                    html = path.read_text(encoding="utf-8", errors="replace")
+                    unavailable_reason = profile_unavailable_reason(html)
+                    if unavailable_reason:
+                        with connect(workspace) as conn:
+                            archived = _mark_profile_unavailable(
+                                conn,
+                                workspace,
+                                url,
+                                path,
+                                unavailable_reason,
+                                write_output=write_shared_outputs,
+                            )
+                        duration = now - item["started"]
+                        print(
+                            f"    UNAVAILABLE | {duration:.2f}s | {archived.name} | "
+                            f"{unavailable_reason}"
+                        )
+                        recorder.record(
+                            page_type="profile",
+                            status="unavailable",
+                            url=url,
+                            duration_seconds=duration,
+                        )
+                        active.pop(url, None)
+                        completed += 1
+                        continue
                     capture_timings = get_capture_metrics(url, server_url=server_url)
                     db_started = time.monotonic()
                     with connect(workspace) as conn:
@@ -996,6 +1173,7 @@ def collect_profile_batch(
                         conn.commit()
                         if write_shared_outputs:
                             export_profile_queue(conn, workspace)
+                    _queue_tab_close(url, server_url)
                     print(f"    TIMEOUT | {now - item['started']:.2f}s | {url}")
                     recorder.record(
                         page_type="profile", status="timeout", url=url,
@@ -1012,6 +1190,31 @@ def collect_profile_batch(
                 url = normalize_url(row["doctor_url"])
                 existing = find_profile_html(workspace, url)
                 if existing:
+                    html = existing.read_text(encoding="utf-8", errors="replace")
+                    unavailable_reason = profile_unavailable_reason(html)
+                    if unavailable_reason:
+                        with connect(workspace) as conn:
+                            archived = _mark_profile_unavailable(
+                                conn,
+                                workspace,
+                                url,
+                                existing,
+                                unavailable_reason,
+                                write_output=write_shared_outputs,
+                            )
+                        scheduled += 1
+                        completed += 1
+                        print(
+                            f"INGEST unavailable profile: {url} | {archived.name} | "
+                            f"{unavailable_reason}"
+                        )
+                        recorder.record(
+                            page_type="profile",
+                            status="unavailable",
+                            url=url,
+                            duration_seconds=0.0,
+                        )
+                        continue
                     db_started = time.monotonic()
                     with connect(workspace) as conn:
                         mark_profile_saved(
@@ -1053,6 +1256,8 @@ def collect_profile_batch(
 
         return completed
     finally:
+        for url in tuple(active):
+            _queue_tab_close(url, server_url)
         summary = recorder.finish()
         if summary:
             print(
@@ -1208,4 +1413,5 @@ def collect_one_profile(
         )
         conn.commit()
         export_profile_queue(conn, workspace)
+    _queue_tab_close(url, server_url)
     raise TimeoutError(f"No saved profile HTML after {timeout_seconds}s: {url}")

@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from .listing import _clean_text, _container_location, _provider_profile_url
 from .redux import extract_redux_state
 from .schema import REQUIRED_COLUMNS
-from .urls import normalize_url, profile_path
+from .urls import absolute_zocdoc_url, is_profile_url, normalize_url, profile_path
 from .utils import first_nonempty, nonempty, row_get, tri_bool, walk_dicts
 
 
@@ -63,6 +63,22 @@ def profile_provider_from_redux(redux_state: dict | None, profile_url: str) -> d
         return {}
     scored.sort(key=lambda item: item[0], reverse=True)
     return scored[0][1]
+
+
+def canonical_profile_url(soup: BeautifulSoup, fallback_url: str) -> str:
+    """Prefer the canonical URL embedded by Zocdoc after a browser redirect."""
+    candidates = []
+    canonical = soup.select_one('link[rel="canonical"][href]')
+    if canonical is not None:
+        candidates.append(canonical.get("href"))
+    og_url = soup.select_one('meta[property="og:url"][content]')
+    if og_url is not None:
+        candidates.append(og_url.get("content"))
+    for value in candidates:
+        candidate = absolute_zocdoc_url(str(value or ""))
+        if candidate and is_profile_url(candidate):
+            return candidate
+    return normalize_url(fallback_url)
 
 
 def profile_location_key_map(redux_state: dict | None, provider_id: str) -> dict[str, str]:
@@ -318,8 +334,9 @@ def parse_profile_rows(
 ) -> tuple[list[dict], dict]:
     """Parse one saved profile HTML into the canonical provider-location rows."""
     trace_rows = trace_rows or []
-    profile_url = normalize_url(profile_url)
+    requested_profile_url = normalize_url(profile_url)
     soup = BeautifulSoup(html, "html.parser")
+    profile_url = canonical_profile_url(soup, requested_profile_url)
     redux_state = extract_redux_state(html)
     provider = profile_provider_from_redux(redux_state, profile_url)
 
@@ -519,6 +536,8 @@ def parse_profile_rows(
         rows.append({column: row.get(column, "") for column in REQUIRED_COLUMNS})
 
     diagnostics = {
+        "requested_profile_url": requested_profile_url,
+        "canonical_profile_url": profile_url,
         "redux_found": redux_state is not None,
         "provider_found": bool(provider),
         "trace_occurrences": len(trace_rows),

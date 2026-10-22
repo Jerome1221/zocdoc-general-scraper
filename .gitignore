@@ -56,3 +56,9 @@ workspace_test/
 htmlcov/
 coverage.xml
 *.tmp
+
+# Local delivery archives and Windows shortcuts
+*.lnk
+*.zip
+deliverables/
+backups/

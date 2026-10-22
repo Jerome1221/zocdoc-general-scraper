@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import zocdoc_ortho.runners as runners
+from zocdoc_ortho import runners
 from zocdoc_ortho.workspace import Workspace
 
 
@@ -48,6 +48,9 @@ def test_start_runners_launches_unique_controller_ports(tmp_path: Path, monkeypa
     assert chrome_commands[0][0][-1] == "http://127.0.0.1:8765/controller?runner_id=runner-01&expected_port=8765"
     assert chrome_commands[1][0][-1] == "http://127.0.0.1:8766/controller?runner_id=runner-02&expected_port=8766"
     assert chrome_commands[2][0][-1] == "http://127.0.0.1:8767/controller?runner_id=runner-03&expected_port=8767"
+    assert all("--disable-gpu" in command for command, _detach in chrome_commands)
+    assert all("--disable-gpu-shader-disk-cache" in command for command, _detach in chrome_commands)
+    assert all("--disable-skia-graphite" in command for command, _detach in chrome_commands)
     assert all(detach is False for _command, detach in chrome_commands)
 
     saver_commands = [
@@ -58,7 +61,7 @@ def test_start_runners_launches_unique_controller_ports(tmp_path: Path, monkeypa
 
     state = json.loads((workspace.root / ".runners" / "state.json").read_text(encoding="utf-8"))
     assert [row["port"] for row in state["runners"]] == [8765, 8766, 8767]
-    assert [row["launch_version"] for row in state["runners"]] == [3, 3, 3]
+    assert [row["launch_version"] for row in state["runners"]] == [8, 8, 8]
 
 
 def test_old_launch_state_is_not_reused(tmp_path: Path, monkeypatch):

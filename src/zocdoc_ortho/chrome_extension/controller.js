@@ -38,6 +38,24 @@
     if (busy) return;
     busy = true;
     try {
+      const closeResponse = await fetch(SERVER + "/next-close", { cache: "no-store" });
+      const closeData = await closeResponse.json();
+      if (closeData && closeData.ok && closeData.url) {
+        await new Promise((resolve) => {
+          chrome.runtime.sendMessage(
+            { type: "CLOSE_REQUESTED_TABS", url: closeData.url },
+            (result) => {
+              if (chrome.runtime.lastError) {
+                console.error("[Zocdoc Controller] close runtime error:", chrome.runtime.lastError.message);
+              } else {
+                console.log("[Zocdoc Controller] closed stale tabs:", closeData.url, result);
+              }
+              resolve();
+            }
+          );
+        });
+      }
+
       const response = await fetch(SERVER + "/next-open", { cache: "no-store" });
       const data = await response.json();
       if (data && data.ok && data.url) {
